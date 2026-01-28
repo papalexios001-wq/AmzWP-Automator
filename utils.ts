@@ -1264,7 +1264,7 @@ const preExtractAmazonProducts = (html: string): ExtractedProduct[] => {
   for (const pattern of asinPatterns) {
     let match;
     while ((match = pattern.exec(html)) !== null) {
-      const asin = matchtoUpperCase();
+      const asin = match[1].toUpperCase();
       if (asin.length === 10 && /^[A-Z0-9]+$/.test(asin) && !seenAsins.has(asin)) {
         seenAsins.add(asin);
         products.push({ asin, name: '', source: 'link', confidence: 1.0 });
@@ -1276,7 +1276,7 @@ const preExtractAmazonProducts = (html: string): ExtractedProduct[] => {
   const linkTextPattern = /<a[^>]*amazon\.com[^>]*>([^<]{10,100})<\/a>/gi;
   let linkMatch;
   while ((linkMatch = linkTextPattern.exec(html)) !== null) {
-    const name = linkMatchtrim().replace(/\s+/g, ' ');
+    const name = linkMatch[1].trim().replace(/\s+/g, ' ');
     if (name.length > 10 && !seenNames.has(name.toLowerCase())) {
       seenNames.add(name.toLowerCase());
       products.push({ asin: '', name, source: 'link', confidence: 0.9 });
@@ -1287,7 +1287,7 @@ const preExtractAmazonProducts = (html: string): ExtractedProduct[] => {
   const headingPattern = /<h[1-4][^>]*>([^<]*(?:Best|Top|Review|Pick|Choice|Recommended|Editor|Winner|#\d)[^<]*)<\/h[1-4]>/gi;
   let headingMatch;
   while ((headingMatch = headingPattern.exec(html)) !== null) {
-    const text = headingMatch(/<[^>]*>/g, '').trim();
+    const text = headingMatch[1].replace(/<[^>]*>/g, '').trim();
     if (text.length > 5 && text.length < 150 && !seenNames.has(text.toLowerCase())) {
       seenNames.add(text.toLowerCase());
       products.push({ asin: '', name: text, source: 'heading', confidence: 0.7 });
@@ -1298,7 +1298,7 @@ const preExtractAmazonProducts = (html: string): ExtractedProduct[] => {
   const listPattern = /<li[^>]*>(?:<[^>]*>)*([^<]*(?:[A-Z][a-z]+\s+[A-Z][a-z]+)[^<]{5,80})(?:<[^>]*>)*<\/li>/gi;
   let listMatch;
   while ((listMatch = listPattern.exec(html)) !== null) {
-    const text = listMatchreplace(/<[^>]*>/g, '').trim();
+    const text = listMatch[1].replace(/<[^>]*>/g, '').trim();
     if (text.length > 10 && text.length < 100 && !seenNames.has(text.toLowerCase())) {
       const hasProductIndicator = /\b(pro|plus|max|ultra|mini|lite|series|gen|edition|version|\d{3,4}[a-z]*)\b/i.test(text);
       if (hasProductIndicator) {
