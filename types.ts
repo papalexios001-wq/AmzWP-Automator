@@ -7,7 +7,6 @@ export interface FAQItem {
 }
 
 export type DeploymentMode = 'ELITE_BENTO' | 'TACTICAL_LINK';
-export type BoxStyle = 'CLASSIC' | 'PREMIUM';
 
 export interface AppConfig {
   amazonTag: string;
@@ -23,17 +22,9 @@ export interface AppConfig {
   concurrencyLimit: number; 
   enableSchema: boolean; 
   enableStickyBar: boolean;
-  boxStyle: BoxStyle;
   
   aiProvider: AIProvider;
   aiModel: string;
-  
-  geminiApiKey?: string;
-  openaiApiKey?: string;
-  anthropicApiKey?: string;
-  groqApiKey?: string;
-  openrouterApiKey?: string;
-  customModel?: string;
 }
 
 export interface ProductDetails {
@@ -64,6 +55,12 @@ export interface ComparisonData {
   title: string;
   productIds: string[]; // IDs of the top 3 products
   specs: string[]; // Keys like "Weight", "Battery", "Speed"
+}
+
+// NEW: Carousel Data Structure
+export interface CarouselData {
+  title: string;
+  productIds: string[];
 }
 
 export type PostPriority = 'critical' | 'high' | 'medium' | 'low';

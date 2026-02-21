@@ -1,10 +1,10 @@
 
 import React, { useState, useEffect, Dispatch, SetStateAction } from 'react';
-import { BlogPost, ProductDetails, AppConfig, DeploymentMode, ComparisonData, BoxStyle } from '../types';
-import { pushToWordPress, fetchRawPostContent, analyzeContentAndFindProduct, splitContentIntoBlocks, IntelligenceCache, generateProductBoxHtml, generateComparisonTableHtml, fetchProductByASIN } from '../utils';
+import { BlogPost, ProductDetails, AppConfig, DeploymentMode, ComparisonData, CarouselData } from '../types';
+import { pushToWordPress, fetchRawPostContent, analyzeContentAndFindProduct, splitContentIntoBlocks, IntelligenceCache, generateProductBoxHtml, generateComparisonTableHtml, generateCarouselHtml } from '../utils';
 import { ProductBoxPreview } from './ProductBoxPreview';
-import { PremiumProductBox } from './PremiumProductBox';
 import { ComparisonTablePreview } from './ComparisonTablePreview';
+import { CarouselPreview } from './CarouselPreview';
 import Toastify from 'toastify-js';
 
 interface PostEditorProps {
@@ -17,10 +17,11 @@ interface PostEditorProps {
 
 interface EditorNode {
     id: string;
-    type: 'HTML' | 'PRODUCT' | 'COMPARISON';
+    type: 'HTML' | 'PRODUCT' | 'COMPARISON' | 'CAROUSEL';
     content?: string;
     productId?: string;
     comparisonData?: ComparisonData; // Only for COMPARISON type
+    carouselData?: CarouselData; // Only for CAROUSEL type
 }
 
 export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) => {
@@ -31,8 +32,7 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
     const [status, setStatus] = useState<'idle' | 'fetching' | 'analyzing' | 'pushing' | 'error'>('idle');
     const [viewTab, setViewTab] = useState<'visual' | 'code'>('visual');
     const [hoveredNode, setHoveredNode] = useState<string | null>(null);
-    const [manualAsin, setManualAsin] = useState<string>('');
-    const [addingProduct, setAddingProduct] = useState<boolean>(false);
+    const [showAssetsDeck, setShowAssetsDeck] = useState(false);
 
     // Initialization Logic
     useEffect(() => {
@@ -49,10 +49,12 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                 const cached = IntelligenceCache.getAnalysis(contentHash);
                 
                 let initialComparison: ComparisonData | undefined = undefined;
+                let initialCarousel: CarouselData | undefined = undefined;
 
                 if (cached) {
                     if (initialProducts.length === 0) initialProducts = cached.products;
                     if (cached.comparison) initialComparison = cached.comparison;
+                    if (cached.carousel) initialCarousel = cached.carousel;
                 }
 
                 // 3. Build Product Map
@@ -86,6 +88,15 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                         comparisonData: initialComparison
                     });
                     offset++;
+                }
+
+                // Auto-inject carousel if detected
+                if (initialCarousel) {
+                    nodes.push({
+                        id: `carousel-${Date.now()}`,
+                        type: 'CAROUSEL',
+                        carouselData: initialCarousel
+                    });
                 }
 
                 setEditorNodes(nodes);
@@ -242,6 +253,16 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                 Toastify({ text: "Comparison Matrix Generated", style: { background: "#8b5cf6" } }).showToast();
             }
 
+            // Handle Carousel
+            if (res.carousel) {
+                setEditorNodes(prev => [...prev, {
+                    id: `carousel-${Date.now()}`,
+                    type: 'CAROUSEL',
+                    carouselData: res.carousel
+                }]);
+                Toastify({ text: "Product Carousel Deployed", style: { background: "#ec4899" } }).showToast();
+            }
+
         } catch (e: any) {
             console.error(e);
             // SOTA Error Reporting: Show exact error from the utility function
@@ -284,53 +305,6 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
         return Object.values(productMap).filter(p => !placedIds.has(p.id));
     };
 
-    const extractASIN = (input: string): string | null => {
-        const trimmed = input.trim();
-        if (/^[A-Z0-9]{10}$/i.test(trimmed)) {
-            return trimmed.toUpperCase();
-        }
-        const urlMatch = trimmed.match(/amazon\.com\/(?:dp|gp\/product|exec\/obidos\/ASIN)\/([A-Z0-9]{10})/i);
-        if (urlMatch) {
-            return urlMatch[1].toUpperCase();
-        }
-        const dpMatch = trimmed.match(/\/dp\/([A-Z0-9]{10})/i);
-        if (dpMatch) {
-            return dpMatch[1].toUpperCase();
-        }
-        return null;
-    };
-
-    const handleAddManualProduct = async () => {
-        const asin = extractASIN(manualAsin);
-        if (!asin) {
-            Toastify({ text: "Invalid ASIN or Amazon URL", style: { background: "#ef4444" } }).showToast();
-            return;
-        }
-
-        const existingProduct = Object.values(productMap).find(p => p.asin === asin);
-        if (existingProduct) {
-            Toastify({ text: "Product already in staging area", style: { background: "#f59e0b" } }).showToast();
-            setManualAsin('');
-            return;
-        }
-
-        setAddingProduct(true);
-        try {
-            const product = await fetchProductByASIN(asin, config.serpApiKey || '');
-            if (product) {
-                setProductMap(prev => ({ ...prev, [product.id]: product }));
-                Toastify({ text: `Added: ${product.title.substring(0, 30)}...`, style: { background: "#10b981" } }).showToast();
-                setManualAsin('');
-            } else {
-                Toastify({ text: "Failed to fetch product", style: { background: "#ef4444" } }).showToast();
-            }
-        } catch (e) {
-            Toastify({ text: "Error adding product", style: { background: "#ef4444" } }).showToast();
-        } finally {
-            setAddingProduct(false);
-        }
-    };
-
     const generateFinalHtml = () => {
         return editorNodes.map(node => {
             if (node.type === 'HTML') return node.content;
@@ -339,6 +313,9 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
             }
             if (node.type === 'COMPARISON' && node.comparisonData) {
                 return generateComparisonTableHtml(node.comparisonData, Object.values(productMap), config.amazonTag);
+            }
+            if (node.type === 'CAROUSEL' && node.carouselData) {
+                return generateCarouselHtml(node.carouselData, Object.values(productMap), config.amazonTag);
             }
             return '';
         }).join('\n\n');
@@ -359,15 +336,34 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
     };
 
     return (
-        <div className="flex h-full bg-dark-950 flex-col md:flex-row overflow-hidden animate-fade-in font-sans">
+        <div className="flex h-full bg-dark-950 flex-col md:flex-row overflow-hidden animate-fade-in font-sans relative">
             
-            {/* --- LEFT CONTROL PANEL --- */}
-            <div className="w-full md:w-[420px] bg-[#0b1121] border-r border-dark-800 flex flex-col h-full z-40 shadow-[10px_0_30px_rgba(0,0,0,0.3)]">
+            {/* Mobile Assets Deck Overlay */}
+            {showAssetsDeck && (
+                <div 
+                    className="fixed inset-0 bg-dark-950/80 backdrop-blur-sm z-40 md:hidden animate-fade-in"
+                    onClick={() => setShowAssetsDeck(false)}
+                />
+            )}
+
+            {/* --- LEFT CONTROL PANEL (Assets Deck) --- */}
+            <div className={`
+                fixed inset-y-0 left-0 w-full sm:w-[420px] bg-[#0b1121] border-r border-dark-800 flex flex-col h-full z-50 shadow-[10px_0_30px_rgba(0,0,0,0.3)] transition-transform duration-500 md:relative md:translate-x-0
+                ${showAssetsDeck ? 'translate-x-0' : '-translate-x-full'}
+            `}>
                 {/* Header */}
-                <div className="p-8 border-b border-dark-800 bg-dark-950/50 backdrop-blur-md">
-                    <button onClick={onBack} className="text-gray-500 text-[10px] font-black uppercase tracking-[4px] hover:text-white transition-all flex items-center gap-3 group mb-6">
-                        <i className="fa-solid fa-arrow-left group-hover:-translate-x-1 transition-transform"></i> Return to Command
-                    </button>
+                <div className="p-6 md:p-8 border-b border-dark-800 bg-dark-950/50 backdrop-blur-md">
+                    <div className="flex items-center justify-between mb-6">
+                        <button onClick={onBack} className="text-gray-500 text-[10px] font-black uppercase tracking-[4px] hover:text-white transition-all flex items-center gap-3 group">
+                            <i className="fa-solid fa-arrow-left group-hover:-translate-x-1 transition-transform"></i> <span className="hidden sm:inline">Return to Command</span><span className="sm:hidden">Back</span>
+                        </button>
+                        <button 
+                            onClick={() => setShowAssetsDeck(false)}
+                            className="md:hidden w-10 h-10 rounded-full bg-dark-800 text-gray-400 flex items-center justify-center"
+                        >
+                            <i className="fa-solid fa-xmark"></i>
+                        </button>
+                    </div>
                     <div className="flex items-center justify-between">
                         <h1 className="text-xl font-black text-white tracking-tight">Assets <span className="text-brand-500">deck</span></h1>
                         <div className="flex gap-3">
@@ -377,41 +373,17 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                 </div>
 
                 {/* Scan & Unused Assets */}
-                <div className="flex-1 overflow-y-auto p-8 space-y-10 custom-scrollbar">
+                <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-8 md:space-y-10 custom-scrollbar">
                     
                     {/* Deep Scan Card */}
-                    <div className="relative overflow-hidden rounded-[32px] bg-gradient-to-br from-brand-900/20 to-dark-900 border border-brand-500/20 p-8 group">
+                    <div className="relative overflow-hidden rounded-[24px] md:rounded-[32px] bg-gradient-to-br from-brand-900/20 to-dark-900 border border-brand-500/20 p-6 md:p-8 group">
                         <div className="absolute top-0 right-0 w-32 h-32 bg-brand-500/10 blur-[60px] rounded-full"></div>
-                        <h3 className="text-brand-400 font-black uppercase tracking-[4px] text-[11px] mb-2">Deep Intelligence</h3>
-                        <p className="text-slate-400 text-xs mb-6 leading-relaxed">Analyze content DNA to extract monetization nodes.</p>
+                        <h3 className="text-brand-400 font-black uppercase tracking-[4px] text-[10px] md:text-[11px] mb-2">Deep Intelligence</h3>
+                        <p className="text-slate-400 text-[11px] md:text-xs mb-6 leading-relaxed">Analyze content DNA to extract monetization nodes.</p>
                         <div className="flex gap-2">
-                             <button onClick={runDeepScan} disabled={status !== 'idle'} className="flex-1 py-4 bg-brand-600 hover:bg-brand-500 text-white rounded-xl text-xs font-black uppercase tracking-widest shadow-lg transition-all flex items-center justify-center gap-2">
+                             <button onClick={() => { runDeepScan(); setShowAssetsDeck(false); }} disabled={status !== 'idle'} className="flex-1 py-4 bg-brand-600 hover:bg-brand-500 text-white rounded-xl text-xs font-black uppercase tracking-widest shadow-lg transition-all flex items-center justify-center gap-2">
                                 {status === 'analyzing' ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-bolt"></i>}
                                 <span>Scan</span>
-                            </button>
-                        </div>
-                    </div>
-
-                    {/* Manual Product Add Card */}
-                    <div className="relative overflow-hidden rounded-[32px] bg-gradient-to-br from-orange-900/20 to-dark-900 border border-orange-500/20 p-8 group">
-                        <div className="absolute top-0 right-0 w-32 h-32 bg-orange-500/10 blur-[60px] rounded-full"></div>
-                        <h3 className="text-orange-400 font-black uppercase tracking-[4px] text-[11px] mb-2">Manual Add</h3>
-                        <p className="text-slate-400 text-xs mb-4 leading-relaxed">Add any Amazon product by ASIN or URL.</p>
-                        <div className="flex gap-2">
-                            <input 
-                                type="text" 
-                                value={manualAsin}
-                                onChange={(e) => setManualAsin(e.target.value)}
-                                onKeyDown={(e) => e.key === 'Enter' && handleAddManualProduct()}
-                                placeholder="ASIN or Amazon URL"
-                                className="flex-1 px-4 py-3 bg-dark-800 border border-dark-700 rounded-xl text-white text-xs placeholder-dark-500 focus:outline-none focus:border-orange-500 transition-all"
-                            />
-                            <button 
-                                onClick={handleAddManualProduct} 
-                                disabled={addingProduct || !manualAsin.trim()}
-                                className="px-6 py-3 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 disabled:hover:bg-orange-600 text-white rounded-xl text-xs font-black uppercase tracking-widest shadow-lg transition-all flex items-center justify-center gap-2"
-                            >
-                                {addingProduct ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-plus"></i>}
                             </button>
                         </div>
                     </div>
@@ -419,30 +391,30 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                     {/* Draggable/Injectable Assets */}
                     <div>
                         <div className="flex items-center justify-between mb-6">
-                            <h3 className="text-gray-500 font-black uppercase tracking-[4px] text-[10px]">Staging Area</h3>
-                            <span className="bg-dark-800 text-gray-400 px-3 py-1 rounded-full text-[10px] font-bold">{getUnplacedProducts().length}</span>
+                            <h3 className="text-gray-500 font-black uppercase tracking-[4px] text-[9px] md:text-[10px]">Staging Area</h3>
+                            <span className="bg-dark-800 text-gray-400 px-3 py-1 rounded-full text-[9px] md:text-[10px] font-bold">{getUnplacedProducts().length}</span>
                         </div>
                         
                         <div className="space-y-4">
                             {getUnplacedProducts().length === 0 ? (
-                                <div className="p-8 border-2 border-dashed border-dark-800 rounded-3xl text-center">
+                                <div className="p-8 border-2 border-dashed border-dark-800 rounded-2xl md:rounded-3xl text-center">
                                     <div className="text-dark-700 mb-2 text-2xl"><i className="fa-brands fa-dropbox"></i></div>
-                                    <div className="text-dark-600 text-[10px] font-black uppercase tracking-widest">Queue Empty</div>
+                                    <div className="text-dark-600 text-[9px] md:text-[10px] font-black uppercase tracking-widest">Queue Empty</div>
                                 </div>
                             ) : (
                                 getUnplacedProducts().map(p => (
-                                    <div key={p.id} className="bg-dark-900 border border-dark-700 p-4 rounded-2xl flex items-center gap-4 group hover:border-brand-500 transition-all">
-                                        <img src={p.imageUrl} className="w-12 h-12 object-contain bg-white rounded-lg p-1" />
+                                    <div key={p.id} className="bg-dark-900 border border-dark-700 p-4 rounded-xl md:rounded-2xl flex items-center gap-4 group hover:border-brand-500 transition-all">
+                                        <img src={p.imageUrl} className="w-10 h-10 md:w-12 md:h-12 object-contain bg-white rounded-lg p-1" />
                                         <div className="flex-1 min-w-0">
-                                            <div className="text-white font-bold text-sm truncate">{p.title}</div>
-                                            <div className="text-brand-400 text-[10px] font-black tracking-wider">{p.price}</div>
+                                            <div className="text-white font-bold text-xs md:text-sm truncate">{p.title}</div>
+                                            <div className="text-brand-400 text-[9px] md:text-[10px] font-black tracking-wider">{p.price}</div>
                                         </div>
                                         <button 
-                                            onClick={() => smartInjectProduct(p.id)} 
+                                            onClick={() => { smartInjectProduct(p.id); setShowAssetsDeck(false); }} 
                                             className="w-8 h-8 rounded-full bg-brand-600 text-white flex items-center justify-center shadow-lg hover:scale-110 transition-transform hover:bg-white hover:text-brand-600"
                                             title="Smart Auto-Inject"
                                         >
-                                            <i className="fa-solid fa-wand-magic-sparkles text-xs"></i>
+                                            <i className="fa-solid fa-wand-magic-sparkles text-[10px]"></i>
                                         </button>
                                     </div>
                                 ))
@@ -452,8 +424,8 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                 </div>
 
                 {/* Push Action */}
-                <div className="p-8 bg-dark-950 border-t border-dark-800">
-                    <button onClick={handlePush} disabled={status !== 'idle'} className="w-full py-6 bg-white text-dark-950 rounded-[20px] font-black uppercase tracking-[4px] text-sm shadow-[0_0_30px_rgba(255,255,255,0.1)] hover:shadow-[0_0_50px_rgba(255,255,255,0.2)] hover:scale-[1.02] transition-all flex items-center justify-center gap-3">
+                <div className="p-6 md:p-8 bg-dark-950 border-t border-dark-800">
+                    <button onClick={handlePush} disabled={status !== 'idle'} className="w-full py-4 md:py-6 bg-white text-dark-950 rounded-xl md:rounded-[20px] font-black uppercase tracking-[2px] md:tracking-[4px] text-xs md:text-sm shadow-[0_0_30px_rgba(255,255,255,0.1)] hover:shadow-[0_0_50px_rgba(255,255,255,0.2)] hover:scale-[1.02] transition-all flex items-center justify-center gap-3">
                         {status === 'pushing' ? <i className="fa-solid fa-circle-notch fa-spin"></i> : <i className="fa-solid fa-cloud-arrow-up"></i>}
                         <span>Deploy Live</span>
                     </button>
@@ -464,38 +436,48 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
             <div className="flex-1 bg-slate-50 relative flex flex-col h-full overflow-hidden">
                 
                 {/* Global Toolbar */}
-                <div className="absolute top-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-4">
-                     {/* View Toggles */}
-                    <div className="bg-white/80 backdrop-blur-xl border border-white/20 shadow-2xl rounded-full p-1.5 flex gap-2">
-                        {['visual', 'code'].map((v) => (
-                            <button 
-                                key={v}
-                                onClick={() => setViewTab(v as any)}
-                                className={`px-8 py-3 rounded-full text-[10px] font-black uppercase tracking-[3px] transition-all ${viewTab === v ? 'bg-dark-950 text-white shadow-lg' : 'text-slate-400 hover:text-slate-600 hover:bg-slate-100'}`}
-                            >
-                                {v === 'visual' ? 'Visual Architect' : 'Code Matrix'}
-                            </button>
-                        ))}
-                    </div>
+                <div className="absolute top-4 md:top-6 left-0 right-0 px-4 md:px-0 z-40 flex flex-col sm:flex-row items-center justify-center gap-3 md:gap-4">
+                    
+                    <div className="flex items-center gap-2 md:gap-4 w-full sm:w-auto justify-center">
+                        <button 
+                            onClick={() => setShowAssetsDeck(true)}
+                            className="md:hidden w-11 h-11 rounded-full bg-dark-950 text-white flex items-center justify-center shadow-2xl border border-white/10"
+                        >
+                            <i className="fa-solid fa-box-open text-xs"></i>
+                        </button>
 
-                    {/* Auto-Deploy Button */}
-                    <button 
-                        onClick={handleAutoPopulate}
-                        disabled={getUnplacedProducts().length === 0}
-                        className="h-[46px] px-8 bg-brand-600 text-white rounded-full text-[10px] font-black uppercase tracking-[3px] shadow-2xl hover:bg-brand-500 hover:scale-105 disabled:opacity-50 disabled:scale-100 transition-all flex items-center gap-2"
-                        title="Automatically place ALL products based on context"
-                    >
-                         <i className="fa-solid fa-wand-magic-sparkles"></i> Auto-Deploy All
-                    </button>
+                        {/* View Toggles */}
+                        <div className="bg-white/80 backdrop-blur-xl border border-white/20 shadow-2xl rounded-full p-1 flex gap-1 md:gap-2">
+                            {['visual', 'code'].map((v) => (
+                                <button 
+                                    key={v}
+                                    onClick={() => setViewTab(v as any)}
+                                    className={`px-4 md:px-8 py-2 md:py-3 rounded-full text-[8px] md:text-[10px] font-black uppercase tracking-[2px] md:tracking-[3px] transition-all ${viewTab === v ? 'bg-dark-950 text-white shadow-lg' : 'text-slate-400 hover:text-slate-600 hover:bg-slate-100'}`}
+                                >
+                                    {v === 'visual' ? 'Visual' : 'Code'}
+                                </button>
+                            ))}
+                        </div>
+
+                        {/* Auto-Deploy Button */}
+                        <button 
+                            onClick={handleAutoPopulate}
+                            disabled={getUnplacedProducts().length === 0}
+                            className="h-[40px] md:h-[46px] px-4 md:px-8 bg-brand-600 text-white rounded-full text-[8px] md:text-[10px] font-black uppercase tracking-[2px] md:tracking-[3px] shadow-2xl hover:bg-brand-500 hover:scale-105 disabled:opacity-50 disabled:scale-100 transition-all flex items-center gap-2"
+                            title="Automatically place ALL products based on context"
+                        >
+                             <i className="fa-solid fa-wand-magic-sparkles"></i> <span className="hidden sm:inline">Auto-Deploy All</span>
+                        </button>
+                    </div>
                 </div>
 
                 {/* Canvas Area */}
-                <div className="flex-1 overflow-y-auto overflow-x-hidden p-8 md:p-20 custom-scrollbar">
+                <div className="flex-1 overflow-y-auto overflow-x-hidden p-4 md:p-20 pt-24 md:pt-32 custom-scrollbar">
                     {viewTab === 'visual' ? (
-                        <div className="max-w-[1000px] mx-auto min-h-screen bg-white rounded-[60px] shadow-[0_40px_100px_-30px_rgba(0,0,0,0.08)] border border-slate-100 p-12 md:p-24 relative">
+                        <div className="max-w-[1000px] mx-auto min-h-screen bg-white rounded-[32px] md:rounded-[60px] shadow-[0_40px_100px_-30px_rgba(0,0,0,0.08)] border border-slate-100 p-6 md:p-24 relative">
                             
                             {/* Document Title (Read Only Preview) */}
-                            <h1 className="text-4xl md:text-6xl font-black text-slate-900 tracking-tighter mb-16 leading-tight border-b border-slate-100 pb-10">
+                            <h1 className="text-2xl md:text-6xl font-black text-slate-900 tracking-tighter mb-8 md:text-center md:mb-16 leading-tight border-b border-slate-100 pb-6 md:pb-10">
                                 {post.title}
                             </h1>
 
@@ -505,70 +487,64 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                                         key={node.id}
                                         onMouseEnter={() => setHoveredNode(node.id)}
                                         onMouseLeave={() => setHoveredNode(null)}
-                                        className={`relative group/node transition-all duration-300 rounded-[32px] border-2 ${hoveredNode === node.id ? 'border-brand-100 bg-brand-50/10' : 'border-transparent'}`}
+                                        className={`relative group/node transition-all duration-300 rounded-[20px] md:rounded-[32px] border-2 ${hoveredNode === node.id ? 'border-brand-100 bg-brand-50/10' : 'border-transparent'}`}
                                     >
                                         
                                         {/* --- BLOCK CONTROLS (Floating Glass) --- */}
-                                        <div className={`absolute -right-14 top-4 flex flex-col gap-2 transition-all duration-300 z-30 ${hoveredNode === node.id ? 'opacity-100 translate-x-0' : 'opacity-0 -translate-x-4 pointer-events-none'}`}>
-                                            <button onClick={() => moveNode(index, -1)} className="w-10 h-10 rounded-full bg-white text-slate-400 hover:text-brand-500 shadow-xl border border-slate-100 flex items-center justify-center transition-all hover:scale-110" title="Move Up"><i className="fa-solid fa-arrow-up text-xs"></i></button>
-                                            <button onClick={() => moveNode(index, 1)} className="w-10 h-10 rounded-full bg-white text-slate-400 hover:text-brand-500 shadow-xl border border-slate-100 flex items-center justify-center transition-all hover:scale-110" title="Move Down"><i className="fa-solid fa-arrow-down text-xs"></i></button>
-                                            <button onClick={() => deleteNode(node.id)} className="w-10 h-10 rounded-full bg-white text-slate-400 hover:text-red-500 shadow-xl border border-slate-100 flex items-center justify-center transition-all hover:scale-110" title="Delete Block"><i className="fa-solid fa-trash-can text-xs"></i></button>
+                                        <div className={`absolute -right-2 md:-right-14 top-2 md:top-4 flex md:flex-col gap-1 md:gap-2 transition-all duration-300 z-30 ${hoveredNode === node.id ? 'opacity-100 translate-x-0' : 'opacity-0 md:-translate-x-4 pointer-events-none'}`}>
+                                            <button onClick={() => moveNode(index, -1)} className="w-8 h-8 md:w-10 md:h-10 rounded-full bg-white text-slate-400 hover:text-brand-500 shadow-xl border border-slate-100 flex items-center justify-center transition-all hover:scale-110" title="Move Up"><i className="fa-solid fa-arrow-up text-[10px]"></i></button>
+                                            <button onClick={() => moveNode(index, 1)} className="w-8 h-8 md:w-10 md:h-10 rounded-full bg-white text-slate-400 hover:text-brand-500 shadow-xl border border-slate-100 flex items-center justify-center transition-all hover:scale-110" title="Move Down"><i className="fa-solid fa-arrow-down text-[10px]"></i></button>
+                                            <button onClick={() => deleteNode(node.id)} className="w-8 h-8 md:w-10 md:h-10 rounded-full bg-white text-slate-400 hover:text-red-500 shadow-xl border border-slate-100 flex items-center justify-center transition-all hover:scale-110" title="Delete Block"><i className="fa-solid fa-trash-can text-[10px]"></i></button>
                                             
                                             {/* Special Media Cleaner for HTML Blocks */}
                                             {node.type === 'HTML' && node.content && (node.content.includes('<img') || node.content.includes('figure')) && (
-                                                <button onClick={() => cleanImagesFromBlock(node.id)} className="w-10 h-10 rounded-full bg-white text-orange-400 hover:text-orange-600 shadow-xl border border-slate-100 flex items-center justify-center transition-all hover:scale-110" title="Remove Images Only"><i className="fa-solid fa-image-slash text-xs"></i></button>
+                                                <button onClick={() => cleanImagesFromBlock(node.id)} className="w-8 h-8 md:w-10 md:h-10 rounded-full bg-white text-orange-400 hover:text-orange-600 shadow-xl border border-slate-100 flex items-center justify-center transition-all hover:scale-110" title="Remove Images Only"><i className="fa-solid fa-image-slash text-[10px]"></i></button>
                                             )}
                                         </div>
 
                                         {/* --- RENDER CONTENT --- */}
-                                        <div className="p-2 md:p-6">
+                                        <div className="p-1 md:p-6">
                                             {node.type === 'HTML' ? (
                                                 <div 
-                                                    className="prose prose-xl prose-slate max-w-none focus:outline-none focus:ring-2 focus:ring-brand-100 rounded-xl p-2 transition-all"
+                                                    className="prose prose-lg md:prose-xl prose-slate max-w-none focus:outline-none focus:ring-2 focus:ring-brand-100 rounded-xl p-2 transition-all"
                                                     contentEditable
                                                     suppressContentEditableWarning
                                                     onBlur={(e) => updateHtmlNode(node.id, e.currentTarget.innerHTML)}
                                                     dangerouslySetInnerHTML={{ __html: node.content || '' }}
                                                 />
                                             ) : node.type === 'COMPARISON' && node.comparisonData ? (
-                                                <ComparisonTablePreview 
-                                                    data={node.comparisonData} 
+                                                <div className="overflow-x-auto scrollbar-hide -mx-2 px-2">
+                                                    <ComparisonTablePreview 
+                                                        data={node.comparisonData} 
+                                                        products={Object.values(productMap)} 
+                                                        affiliateTag={config.amazonTag} 
+                                                    />
+                                                </div>
+                                            ) : node.type === 'CAROUSEL' && node.carouselData ? (
+                                                <CarouselPreview 
+                                                    data={node.carouselData} 
                                                     products={Object.values(productMap)} 
-                                                    affiliateTag={config.amazonTag} 
                                                 />
                                             ) : (
                                                 node.productId && productMap[node.productId] ? (
                                                     <div className="relative">
-                                                        {config.boxStyle === 'PREMIUM' ? (
-                                                            <PremiumProductBox 
-                                                                product={productMap[node.productId]} 
-                                                                affiliateTag={config.amazonTag} 
-                                                                mode={productMap[node.productId].deploymentMode}
-                                                                variant={productMap[node.productId].deploymentMode === 'TACTICAL_LINK' ? 'MINIMAL_FLOAT' : 'LUXE_CARD'}
-                                                            />
-                                                        ) : (
-                                                            <ProductBoxPreview 
-                                                                product={productMap[node.productId]} 
-                                                                affiliateTag={config.amazonTag} 
-                                                                mode={productMap[node.productId].deploymentMode} 
-                                                            />
-                                                        )}
+                                                        <ProductBoxPreview product={productMap[node.productId]} affiliateTag={config.amazonTag} mode={productMap[node.productId].deploymentMode} />
                                                         
                                                         {/* Product Specific Controls */}
                                                         {hoveredNode === node.id && (
-                                                            <div className="absolute top-6 right-6 flex gap-3 z-30 animate-fade-in-up">
+                                                            <div className="absolute top-2 md:top-6 left-2 md:left-auto md:right-6 flex gap-2 md:gap-3 z-30 animate-fade-in-up">
                                                                 <button 
                                                                     onClick={() => updateProductMode(node.productId!, 'ELITE_BENTO')} 
-                                                                    className={`px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-wider shadow-lg transition-all ${productMap[node.productId!].deploymentMode === 'ELITE_BENTO' ? 'bg-dark-950 text-white' : 'bg-white text-slate-500'}`}
+                                                                    className={`px-3 md:px-4 py-1.5 md:py-2 rounded-full text-[8px] md:text-[10px] font-black uppercase tracking-wider shadow-lg transition-all ${productMap[node.productId!].deploymentMode === 'ELITE_BENTO' ? 'bg-dark-950 text-white' : 'bg-white text-slate-500'}`}
                                                                 >Bento</button>
                                                                 <button 
                                                                     onClick={() => updateProductMode(node.productId!, 'TACTICAL_LINK')} 
-                                                                    className={`px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-wider shadow-lg transition-all ${productMap[node.productId!].deploymentMode === 'TACTICAL_LINK' ? 'bg-dark-950 text-white' : 'bg-white text-slate-500'}`}
+                                                                    className={`px-3 md:px-4 py-1.5 md:py-2 rounded-full text-[8px] md:text-[10px] font-black uppercase tracking-wider shadow-lg transition-all ${productMap[node.productId!].deploymentMode === 'TACTICAL_LINK' ? 'bg-dark-950 text-white' : 'bg-white text-slate-500'}`}
                                                                 >Tactical</button>
                                                             </div>
                                                         )}
                                                     </div>
-                                                ) : <div className="p-8 bg-red-50 text-red-400 font-mono text-xs text-center border border-red-100 rounded-2xl">Asset Data Corrupted</div>
+                                                ) : <div className="p-8 bg-red-50 text-red-400 font-mono text-[10px] text-center border border-red-100 rounded-2xl">Asset Data Corrupted</div>
                                             )}
                                         </div>
 
@@ -585,6 +561,25 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                                                         newNodes.splice(index + 1, 0, { id: `html-${Date.now()}`, type: 'HTML', content: '<p>Write something brilliant...</p>' });
                                                         setEditorNodes(newNodes);
                                                     }} className="text-left px-3 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50 rounded-lg transition-colors">Text Block</button>
+                                                    
+                                                    <button onClick={() => {
+                                                        const products = Object.values(productMap);
+                                                        if (products.length < 2) {
+                                                            Toastify({ text: "Need at least 2 assets for carousel", style: { background: "#f59e0b" } }).showToast();
+                                                            return;
+                                                        }
+                                                        const newNodes = [...editorNodes];
+                                                        newNodes.splice(index + 1, 0, { 
+                                                            id: `carousel-${Date.now()}`, 
+                                                            type: 'CAROUSEL', 
+                                                            carouselData: {
+                                                                title: "Featured Selection",
+                                                                productIds: products.slice(0, 6).map(p => p.id)
+                                                            }
+                                                        });
+                                                        setEditorNodes(newNodes);
+                                                        Toastify({ text: "Carousel Injected", style: { background: "#ec4899" } }).showToast();
+                                                    }} className="text-left px-3 py-2 text-xs font-bold text-pink-600 hover:bg-pink-50 rounded-lg transition-colors">Product Carousel</button>
                                                     
                                                     <div className="h-px bg-slate-100 my-1"></div>
                                                     <div className="text-[9px] font-black uppercase text-brand-300 px-3 py-1">Relevant Assets</div>
@@ -607,8 +602,8 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                                 
                                 {/* Empty State / End Injection */}
                                 {editorNodes.length === 0 && (
-                                    <div className="py-40 text-center border-2 border-dashed border-slate-200 rounded-[40px]">
-                                        <p className="text-slate-400 font-bold uppercase tracking-widest text-xs mb-4">Canvas Empty</p>
+                                    <div className="py-20 md:py-40 text-center border-2 border-dashed border-slate-200 rounded-[24px] md:rounded-[40px]">
+                                        <p className="text-slate-400 font-bold uppercase tracking-widest text-[10px] md:text-xs mb-4">Canvas Empty</p>
                                         <button onClick={() => setEditorNodes([{id: 'init', type:'HTML', content:'<p>Start writing...</p>'}])} className="text-brand-500 font-black underline">Initialize Block</button>
                                     </div>
                                 )}
@@ -616,8 +611,8 @@ export const PostEditor: React.FC<PostEditorProps> = ({ post, config, onBack }) 
                         </div>
                     ) : (
                         // Code View
-                        <div className="max-w-4xl mx-auto h-full">
-                            <div className="bg-[#1e1e1e] text-blue-300 p-10 rounded-[40px] shadow-2xl font-mono text-sm leading-relaxed overflow-auto min-h-[80vh] border border-white/10">
+                        <div className="max-w-4xl mx-auto h-full px-4">
+                            <div className="bg-[#1e1e1e] text-blue-300 p-6 md:p-10 rounded-[24px] md:rounded-[40px] shadow-2xl font-mono text-xs md:text-sm leading-relaxed overflow-auto min-h-[80vh] border border-white/10">
                                 {generateFinalHtml()}
                             </div>
                         </div>

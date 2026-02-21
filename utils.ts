@@ -20,7 +20,8 @@ import {
   PostPriority, 
   PostType, 
   DeploymentMode, 
-  ComparisonData
+  ComparisonData,
+  CarouselData
 } from './types';
 import { GoogleGenAI } from '@google/genai';
 
@@ -119,6 +120,7 @@ interface ProxyConfig {
 interface AnalysisCacheData {
   products: ProductDetails[];
   comparison?: ComparisonData;
+  carousel?: CarouselData;
 }
 
 // ============================================================================
@@ -697,67 +699,35 @@ export const fetchAndParseSitemap = async (
     }
   }
 
-  // Strategy 1: WordPress REST API (if credentials available) - PAGINATED to get ALL posts
+  // Strategy 1: WordPress REST API (if credentials available)
   if (config.wpUrl && config.wpUser && config.wpAppPassword && targetUrl.includes(config.wpUrl)) {
     try {
       const wpBase = config.wpUrl.replace(/\/$/, '');
       const auth = btoa(`${config.wpUser}:${config.wpAppPassword}`);
       
-      const allPosts: BlogPost[] = [];
-      let page = 1;
-      const perPage = 100; // WordPress max
-      let hasMore = true;
-      
-      console.log('[fetchAndParseSitemap] Fetching ALL posts via WordPress REST API...');
-      
-      while (hasMore) {
-        const res = await fetch(
-          `${wpBase}/wp-json/wp/v2/posts?per_page=${perPage}&page=${page}&_fields=id,link,title,status,type`,
-          {
-            headers: { 'Authorization': `Basic ${auth}` },
-            signal: AbortSignal.timeout(30000),
-          }
-        );
+      const res = await fetch(
+        `${wpBase}/wp-json/wp/v2/posts?per_page=100&_fields=id,link,title,status,type`,
+        {
+          headers: { 'Authorization': `Basic ${auth}` },
+          signal: AbortSignal.timeout(15000),
+        }
+      );
 
-        if (!res.ok) {
-          if (page === 1) throw new Error('WP API request failed');
-          break; // No more pages
-        }
-        
+      if (res.ok) {
         const data = await res.json();
-        
-        if (!Array.isArray(data) || data.length === 0) {
-          hasMore = false;
-          break;
-        }
-        
-        const posts: BlogPost[] = data.map((p: any, idx: number) => ({
-          id: p.id || Date.now() + (page * perPage) + idx,
+        return data.map((p: any, idx: number) => ({
+          id: p.id || Date.now() + idx,
           title: p.title?.rendered || 'Untitled',
           url: p.link,
-          status: (p.status === 'publish' ? 'publish' : 'draft') as 'publish' | 'draft',
+          status: p.status === 'publish' ? 'publish' : 'draft',
           content: '',
           priority: 'medium' as PostPriority,
           postType: 'unknown' as PostType,
           monetizationStatus: 'analyzing' as const,
         }));
-        
-        allPosts.push(...posts);
-        console.log(`[fetchAndParseSitemap] Page ${page}: fetched ${data.length} posts, total: ${allPosts.length}`);
-        
-        // Check if there are more pages
-        const totalPages = parseInt(res.headers.get('X-WP-TotalPages') || '1', 10);
-        if (page >= totalPages || data.length < perPage) {
-          hasMore = false;
-        } else {
-          page++;
-        }
       }
-      
-      console.log(`[fetchAndParseSitemap] WordPress API: Retrieved ${allPosts.length} total posts`);
-      return allPosts;
-    } catch (err) {
-      console.warn('[fetchAndParseSitemap] WP API failed, trying sitemap XML...', err);
+    } catch {
+      console.warn('[fetchAndParseSitemap] WP API failed, trying sitemap XML...');
     }
   }
 
@@ -789,57 +759,17 @@ export const fetchAndParseSitemap = async (
     throw new ValidationError('Invalid Sitemap XML Format. Please provide a valid sitemap URL.');
   }
 
-  // Handle Sitemap Index (recursive) - Fetch ALL sub-sitemaps
+  // Handle Sitemap Index (recursive)
   const sitemapLocs = Array.from(doc.querySelectorAll('sitemap loc'));
   if (sitemapLocs.length > 0) {
-    console.log(`[fetchAndParseSitemap] Found sitemap index with ${sitemapLocs.length} sub-sitemaps`);
+    // Prefer post-sitemap if available
+    const postSitemap = sitemapLocs.find(n => 
+      (n.textContent || '').toLowerCase().includes('post-sitemap')
+    );
+    const subSitemapUrl = postSitemap?.textContent || sitemapLocs[0].textContent;
     
-    // Collect all sub-sitemap URLs
-    const subSitemapUrls: string[] = [];
-    
-    for (const locNode of sitemapLocs) {
-      const subUrl = locNode.textContent?.trim();
-      if (subUrl && subUrl !== targetUrl) {
-        // Prioritize post-related sitemaps, skip image/video sitemaps
-        const lowerUrl = subUrl.toLowerCase();
-        if (!lowerUrl.includes('image') && !lowerUrl.includes('video') && !lowerUrl.includes('news')) {
-          subSitemapUrls.push(subUrl);
-        }
-      }
-    }
-    
-    if (subSitemapUrls.length > 0) {
-      console.log(`[fetchAndParseSitemap] Fetching ${subSitemapUrls.length} sub-sitemaps...`);
-      
-      // Fetch all sub-sitemaps in parallel with concurrency limit
-      const allPosts: BlogPost[] = [];
-      const seenUrls = new Set<string>();
-      
-      // Process in batches to avoid overwhelming the server
-      const batchSize = 5;
-      for (let i = 0; i < subSitemapUrls.length; i += batchSize) {
-        const batch = subSitemapUrls.slice(i, i + batchSize);
-        const results = await Promise.allSettled(
-          batch.map(url => fetchAndParseSitemap(url, config))
-        );
-        
-        for (const result of results) {
-          if (result.status === 'fulfilled') {
-            for (const post of result.value) {
-              // Deduplicate by URL
-              if (!seenUrls.has(post.url.toLowerCase())) {
-                seenUrls.add(post.url.toLowerCase());
-                allPosts.push(post);
-              }
-            }
-          }
-        }
-        
-        console.log(`[fetchAndParseSitemap] Processed batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(subSitemapUrls.length / batchSize)}, total URLs: ${allPosts.length}`);
-      }
-      
-      console.log(`[fetchAndParseSitemap] Sitemap index: Retrieved ${allPosts.length} total unique URLs`);
-      return allPosts;
+    if (subSitemapUrl && subSitemapUrl !== targetUrl) {
+      return fetchAndParseSitemap(subSitemapUrl, config);
     }
   }
 
@@ -1013,6 +943,60 @@ export const generateComparisonTableHtml = (
 };
 
 // ============================================================================
+// HTML GENERATION - Product Carousel
+// ============================================================================
+
+export const generateCarouselHtml = (
+  data: CarouselData,
+  products: ProductDetails[],
+  affiliateTag: string
+): string => {
+  const sortedProducts = data.productIds
+    .map((id: string) => products.find((p: ProductDetails) => p.id === id))
+    .filter((p): p is ProductDetails => p !== null && p !== undefined);
+
+  if (sortedProducts.length === 0) return '';
+
+  const finalTag = (affiliateTag || 'tag-20').trim();
+
+  return `<!-- wp:html -->
+<style>
+.amz-carousel-v1{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:4rem 0;position:relative;overflow:hidden;padding:20px 0}
+.amz-carousel-header{text-align:center;margin-bottom:30px}
+.amz-carousel-header h2{font-size:24px;font-weight:900;color:#0f172a;letter-spacing:-1px;text-transform:uppercase}
+.amz-carousel-track-wrap{overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none;padding:10px 20px 40px}
+.amz-carousel-track-wrap::-webkit-scrollbar{display:none}
+.amz-carousel-track{display:flex;gap:24px;width:max-content}
+.amz-carousel-item{width:280px;background:#fff;border:1px solid #f1f5f9;border-radius:32px;padding:24px;box-shadow:0 10px 30px -10px rgba(0,0,0,0.05);transition:all 0.4s cubic-bezier(0.4,0,0.2,1);flex-shrink:0;display:flex;flex-direction:column;align-items:center;text-align:center}
+.amz-carousel-item:hover{transform:translateY(-8px);box-shadow:0 20px 50px -15px rgba(0,0,0,0.12);border-color:#e2e8f0}
+.amz-carousel-img{height:180px;width:auto;object-fit:contain;margin-bottom:20px;filter:drop-shadow(0 10px 20px rgba(0,0,0,0.08))}
+.amz-carousel-title{font-size:15px;font-weight:800;color:#0f172a;line-height:1.3;margin-bottom:12px;height:40px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.amz-carousel-price{font-size:22px;font-weight:900;color:#0f172a;margin-bottom:20px;letter-spacing:-1px}
+.amz-carousel-btn{background:#0f172a;color:#fff!important;text-decoration:none!important;padding:12px 24px;border-radius:16px;font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:1px;transition:all 0.3s;display:inline-block;width:100%}
+.amz-carousel-btn:hover{background:#2563eb;box-shadow:0 10px 20px -5px rgba(37,99,235,0.4)}
+</style>
+<div class="amz-carousel-v1">
+  ${data.title ? `<div class="amz-carousel-header"><h2>${escapeHtml(data.title)}</h2></div>` : ''}
+  <div class="amz-carousel-track-wrap">
+    <div class="amz-carousel-track">
+      ${sortedProducts.map((p: ProductDetails) => `
+      <div class="amz-carousel-item">
+        <a href="https://www.amazon.com/dp/${p.asin}?tag=${finalTag}" target="_blank" rel="nofollow sponsored noopener">
+          <img src="${escapeHtml(p.imageUrl)}" class="amz-carousel-img" alt="${escapeHtml(p.title)}" loading="lazy" />
+        </a>
+        <div class="amz-carousel-title">${escapeHtml(p.title)}</div>
+        <div style="color:#fbbf24;font-size:13px;margin-bottom:10px">${'★'.repeat(Math.round(p.rating))}${'☆'.repeat(5 - Math.round(p.rating))}</div>
+        <div class="amz-carousel-price">${escapeHtml(p.price)}</div>
+        <a href="https://www.amazon.com/dp/${p.asin}?tag=${finalTag}" target="_blank" rel="nofollow sponsored noopener" class="amz-carousel-btn">View Deal</a>
+      </div>
+      `).join('')}
+    </div>
+  </div>
+</div>
+<!-- /wp:html -->`;
+};
+
+// ============================================================================
 // HTML GENERATION - Product Box
 // ============================================================================
 
@@ -1054,50 +1038,45 @@ export const generateProductBoxHtml = (
   if (mode === 'TACTICAL_LINK') {
     return `<!-- wp:html -->
 <style>
-.amz-tac-v3{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:950px;margin:2.5rem auto;position:relative}
-.amz-tac-card{background:linear-gradient(to right,#fff,#fff,#fafafa);border:1px solid rgba(226,232,240,0.8);border-radius:28px;padding:1.25rem 1.75rem;box-shadow:0 20px 60px -15px rgba(0,0,0,0.08);display:flex;flex-wrap:wrap;align-items:center;gap:1.5rem;transition:all 0.5s;position:relative;overflow:hidden}
-.amz-tac-card:hover{box-shadow:0 30px 80px -20px rgba(0,0,0,0.15);border-color:#93c5fd}
-.amz-tac-accent{position:absolute;top:0;left:0;width:6px;height:100%;background:linear-gradient(to bottom,#3b82f6,#8b5cf6,#3b82f6);border-radius:28px 0 0 28px}
-.amz-tac-badge{position:absolute;top:-4px;right:-4px;background:linear-gradient(to right,#f59e0b,#f97316);color:#fff;font-size:8px;font-weight:900;text-transform:uppercase;letter-spacing:2px;padding:6px 16px;border-radius:0 26px 0 16px;box-shadow:0 4px 12px rgba(249,115,22,0.3)}
-.amz-tac-img{width:100px;height:100px;background:linear-gradient(to br,#f8fafc,#fff);border-radius:16px;display:flex;align-items:center;justify-content:center;border:1px solid #f1f5f9;padding:12px;flex-shrink:0;box-shadow:inset 0 2px 4px rgba(0,0,0,0.02)}
-.amz-tac-img img{max-width:100%;max-height:100%;object-fit:contain;mix-blend-mode:multiply}
-.amz-tac-info{flex:1;min-width:200px;text-align:left}
-.amz-tac-meta{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}
-.amz-tac-label{font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:2px;color:#2563eb;background:#eff6ff;padding:4px 12px;border-radius:20px;border:1px solid #dbeafe}
-.amz-tac-stars{color:#fbbf24;font-size:13px}
-.amz-tac-reviews{font-size:10px;font-weight:700;color:#94a3b8}
-.amz-tac-title{font-size:1.125rem;font-weight:800;color:#0f172a;line-height:1.3;margin:0 0 6px}
-.amz-tac-desc{font-size:13px;color:#64748b;margin:0;line-height:1.5}
-.amz-tac-action{flex-shrink:0;text-align:center;display:flex;flex-direction:column;gap:12px}
-.amz-tac-price-label{font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#94a3b8;font-weight:700}
-.amz-tac-price{font-size:1.75rem;font-weight:900;color:#0f172a;letter-spacing:-1px}
-.amz-tac-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:linear-gradient(to right,#0f172a,#1e293b);color:#fff!important;text-decoration:none!important;padding:14px 28px;border-radius:14px;font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:2px;transition:all 0.3s;box-shadow:0 10px 30px -10px rgba(15,23,42,0.4)}
-.amz-tac-btn:hover{background:linear-gradient(to right,#2563eb,#3b82f6);transform:translateY(-2px);box-shadow:0 15px 40px -10px rgba(37,99,235,0.4)}
-@media(max-width:768px){.amz-tac-card{flex-direction:column;text-align:center;padding:2rem}.amz-tac-info{text-align:center}.amz-tac-meta{justify-content:center}.amz-tac-action{width:100%}.amz-tac-btn{width:100%}}
+.amz-tac-v4{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:900px;margin:3rem auto;position:relative;isolation:isolate}
+.amz-tac-card{background:#fff;border:1px solid #f1f5f9;border-radius:24px;padding:1.5rem;box-shadow:0 1px 3px rgba(0,0,0,0.05),0 10px 40px -10px rgba(0,0,0,0.04);display:flex;align-items:center;gap:2rem;transition:all 0.4s cubic-bezier(0.4,0,0.2,1);position:relative}
+.amz-tac-card:hover{transform:translateY(-4px);box-shadow:0 20px 60px -15px rgba(0,0,0,0.1);border-color:#e2e8f0}
+.amz-tac-img-box{width:120px;height:120px;background:#f8fafc;border-radius:20px;display:flex;align-items:center;justify-content:center;padding:12px;flex-shrink:0;position:relative;overflow:hidden}
+.amz-tac-img-box img{max-width:100%;max-height:100%;object-fit:contain;transition:transform 0.6s cubic-bezier(0.4,0,0.2,1)}
+.amz-tac-card:hover .amz-tac-img-box img{transform:scale(1.1)}
+.amz-tac-body{flex:1;min-width:0}
+.amz-tac-tag{display:inline-flex;align-items:center;gap:6px;background:#f1f5f9;color:#475569;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1px;padding:4px 12px;border-radius:100px;margin-bottom:12px}
+.amz-tac-title{font-size:1.25rem;font-weight:800;color:#0f172a;line-height:1.2;margin:0 0 8px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.amz-tac-rating{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.amz-tac-stars{color:#fbbf24;font-size:14px;letter-spacing:1px}
+.amz-tac-count{font-size:11px;font-weight:600;color:#94a3b8}
+.amz-tac-side{text-align:right;display:flex;flex-direction:column;align-items:flex-end;gap:12px}
+.amz-tac-price{font-size:1.75rem;font-weight:900;color:#0f172a;letter-spacing:-1px;line-height:1}
+.amz-tac-btn{background:#0f172a;color:#fff!important;text-decoration:none!important;padding:12px 24px;border-radius:14px;font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:1px;transition:all 0.3s;display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.amz-tac-btn:hover{background:#2563eb;box-shadow:0 10px 20px -5px rgba(37,99,235,0.4)}
+@media(max-width:640px){.amz-tac-card{flex-direction:column;text-align:center;padding:2rem}.amz-tac-side{align-items:center;text-align:center;width:100%}.amz-tac-btn{width:100%}}
 </style>
-<div class="amz-tac-v3">
+<div class="amz-tac-v4">
   <div class="amz-tac-card">
-    <div class="amz-tac-accent"></div>
-    <div class="amz-tac-badge">★ Top Rated</div>
-    <div class="amz-tac-img">
+    <div class="amz-tac-img-box">
       <img src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.title)}" loading="lazy" />
     </div>
-    <div class="amz-tac-info">
-      <div class="amz-tac-meta">
-        <span class="amz-tac-label">Editor's Choice</span>
-        <span class="amz-tac-stars">${'★'.repeat(stars)}${'☆'.repeat(5-stars)}</span>
-        <span class="amz-tac-reviews">(${product.reviewCount || '2.4k'})</span>
+    <div class="amz-tac-body">
+      <div class="amz-tac-tag">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg>
+        Verified Choice
       </div>
       <h3 class="amz-tac-title">${escapeHtml(product.title)}</h3>
-      <p class="amz-tac-desc">${escapeHtml(product.verdict || 'Premium selection backed by verified reviews.')}</p>
-    </div>
-    <div class="amz-tac-action">
-      <div>
-        <span class="amz-tac-price-label">Best Price</span>
-        <div class="amz-tac-price">${escapeHtml(product.price)}</div>
+      <div class="amz-tac-rating">
+        <span class="amz-tac-stars">${'★'.repeat(stars)}${'☆'.repeat(5-stars)}</span>
+        <span class="amz-tac-count">${product.reviewCount || '1,200'}+ reviews</span>
       </div>
+    </div>
+    <div class="amz-tac-side">
+      <div class="amz-tac-price">${escapeHtml(product.price)}</div>
       <a href="${link}" target="_blank" rel="nofollow sponsored noopener" class="amz-tac-btn">
-        View Deal <span>→</span>
+        View Deal
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
       </a>
     </div>
   </div>
@@ -1107,172 +1086,114 @@ export const generateProductBoxHtml = (
 
   // ELITE BENTO Mode (Full Product Card)
   const bulletsHtml = bullets.map(b => `
-    <div class="amz-bullet">
-      <div class="amz-bullet-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>
+    <div class="amz-bento-feature">
+      <div class="amz-bento-check">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4"><polyline points="20 6 9 17 4 12"/></svg>
+      </div>
       <span>${escapeHtml(b)}</span>
     </div>
   `).join('');
 
-  const faqsHtml = faqs.map((f, i) => `
-    <div class="amz-faq">
-      <div class="amz-faq-num">Q${i+1}</div>
-      <div class="amz-faq-content">
+  const faqsHtml = faqs.map((f) => `
+    <div class="amz-bento-faq-item">
+      <div class="amz-bento-faq-q">
+        <span class="amz-bento-faq-icon">?</span>
         <h4>${escapeHtml(f.question)}</h4>
-        <p>${escapeHtml(f.answer)}</p>
       </div>
+      <p>${escapeHtml(f.answer)}</p>
     </div>
   `).join('');
 
   return `<!-- wp:html -->
 <style>
-.amz-elite-v3{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:1100px;margin:4rem auto;position:relative}
-.amz-elite-card{background:#fff;border-radius:40px;border:1px solid rgba(226,232,240,0.8);box-shadow:0 50px 100px -30px rgba(0,0,0,0.1);overflow:hidden;transition:all 0.7s}
-.amz-elite-card:hover{box-shadow:0 60px 120px -25px rgba(0,0,0,0.18);border-color:#cbd5e1}
-.amz-elite-badge{position:absolute;top:0;right:0;z-index:30;background:linear-gradient(to right,#0f172a,#1e293b,#0f172a);color:#fff;font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:3px;padding:12px 32px;border-bottom-left-radius:32px;display:flex;align-items:center;gap:8px}
-.amz-elite-badge svg{width:14px;height:14px;color:#fbbf24}
-.amz-elite-grid{display:flex;flex-direction:column}
-@media(min-width:1024px){.amz-elite-grid{flex-direction:row}}
-.amz-elite-visual{background:linear-gradient(to bottom right,rgba(248,250,252,0.8),#fff,rgba(248,250,252,0.5));padding:2.5rem;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;border-bottom:1px solid #f1f5f9}
-@media(min-width:1024px){.amz-elite-visual{width:42%;border-bottom:0;border-right:1px solid #f1f5f9;padding:3.5rem}}
-.amz-elite-rating{position:absolute;top:2rem;left:2rem;background:rgba(255,255,255,0.9);backdrop-filter:blur(12px);border:1px solid #f1f5f9;box-shadow:0 10px 30px -10px rgba(0,0,0,0.1);padding:10px 16px;border-radius:16px;display:flex;align-items:center;gap:12px}
-.amz-elite-rating-stars{color:#fbbf24;font-size:14px}
-.amz-elite-rating-count{font-size:11px;font-weight:700;color:#64748b}
-.amz-elite-img-wrap{position:relative;width:100%;display:flex;align-items:center;justify-content:center;padding:3rem 0}
-.amz-elite-img-wrap::before{content:'';position:absolute;inset:15%;border:2px dashed rgba(226,232,240,0.5);border-radius:50%;opacity:0;transition:opacity 0.5s}
-.amz-elite-card:hover .amz-elite-img-wrap::before{opacity:1}
-.amz-elite-img{max-width:100%;max-height:340px;object-fit:contain;filter:drop-shadow(0 25px 50px rgba(0,0,0,0.15));transition:all 0.7s}
-.amz-elite-card:hover .amz-elite-img{transform:scale(1.1) rotate(-3deg)}
-.amz-elite-brand{display:flex;align-items:center;gap:8px;margin-top:1.5rem}
-.amz-elite-brand::before,.amz-elite-brand::after{content:'';width:32px;height:1px;background:linear-gradient(to right,transparent,#cbd5e1)}
-.amz-elite-brand span{font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:4px;color:#94a3b8}
-.amz-elite-content{padding:2.5rem;display:flex;flex-direction:column;justify-content:space-between;background:#fff}
-@media(min-width:1024px){.amz-elite-content{width:58%;padding:3.5rem}}
-.amz-elite-header{margin-bottom:2rem}
-.amz-elite-cats{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-bottom:1rem}
-.amz-elite-cat{display:inline-flex;align-items:center;gap:6px;background:linear-gradient(to right,#eff6ff,#eef2ff);color:#1d4ed8;font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:2px;padding:8px 16px;border-radius:20px;border:1px solid rgba(191,219,254,0.8)}
-.amz-elite-cat::before{content:'';width:6px;height:6px;background:#3b82f6;border-radius:50%;animation:pulse 2s infinite}
-.amz-elite-ship{font-size:10px;font-weight:700;color:#16a34a;background:#f0fdf4;padding:6px 12px;border-radius:20px;border:1px solid #bbf7d0}
-.amz-elite-title{font-size:2rem;font-weight:900;color:#0f172a;line-height:1.1;letter-spacing:-0.5px;margin:0 0 1.5rem}
-@media(min-width:1024px){.amz-elite-title{font-size:2.5rem}}
-.amz-elite-quote{position:relative;padding:1rem 0 1rem 1.5rem;border-left:4px solid #e2e8f0;margin-bottom:2rem;background:linear-gradient(to right,rgba(248,250,252,0.8),transparent);border-radius:0 12px 12px 0}
-.amz-elite-quote::before{content:'"';position:absolute;left:-.25rem;top:-.5rem;font-size:4rem;color:#dbeafe;font-family:serif;line-height:1}
-.amz-elite-quote p{font-size:1rem;font-weight:500;color:#475569;font-style:italic;line-height:1.7;margin:0}
-@media(min-width:1024px){.amz-elite-quote p{font-size:1.125rem}}
-.amz-bullets{display:grid;grid-template-columns:1fr;gap:12px;margin-bottom:2rem}
-@media(min-width:640px){.amz-bullets{grid-template-columns:1fr 1fr}}
-.amz-bullet{display:flex;align-items:flex-start;gap:12px;padding:1rem;background:linear-gradient(to bottom right,#f8fafc,#fff);border-radius:16px;border:1px solid #f1f5f9;transition:all 0.3s}
-.amz-bullet:hover{border-color:#bbf7d0;box-shadow:0 10px 30px -10px rgba(0,0,0,0.05)}
-.amz-bullet-icon{width:32px;height:32px;border-radius:12px;background:linear-gradient(to bottom right,#22c55e,#16a34a);display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 8px 20px -8px rgba(34,197,94,0.4)}
-.amz-bullet-icon svg{width:14px;height:14px;color:#fff}
-.amz-bullet span{font-size:13px;font-weight:600;color:#334155;line-height:1.4;padding-top:4px}
-.amz-elite-action{margin-top:auto;padding-top:2rem;border-top:1px solid #f1f5f9;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1.5rem}
-.amz-elite-price-wrap{text-align:left}
-.amz-elite-price-meta{display:flex;align-items:center;gap:8px;margin-bottom:8px}
-.amz-elite-price-label{font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:3px;color:#94a3b8}
-.amz-elite-price-save{font-size:9px;font-weight:700;color:#16a34a;background:#f0fdf4;padding:4px 8px;border-radius:20px}
-.amz-elite-price{font-size:3rem;font-weight:900;color:#0f172a;letter-spacing:-2px;line-height:1}
-@media(min-width:1024px){.amz-elite-price{font-size:3.5rem}}
-.amz-elite-btn-wrap{position:relative}
-.amz-elite-btn-glow{position:absolute;inset:0;background:linear-gradient(to right,#2563eb,#3b82f6,#2563eb);border-radius:16px;filter:blur(8px);opacity:0.6}
-.amz-elite-btn{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:16px;background:linear-gradient(to right,#0f172a,#1e293b,#0f172a);color:#fff!important;text-decoration:none!important;padding:1.5rem 3rem;border-radius:16px;font-size:14px;font-weight:900;text-transform:uppercase;letter-spacing:3px;box-shadow:0 20px 40px -15px rgba(15,23,42,0.5);transition:all 0.3s}
-.amz-elite-btn:hover{background:linear-gradient(to right,#2563eb,#3b82f6,#2563eb);transform:translateY(-2px);box-shadow:0 25px 50px -15px rgba(37,99,235,0.5)}
-.amz-elite-btn-icon{width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,0.1);display:flex;align-items:center;justify-content:center}
-.amz-elite-faqs{background:linear-gradient(to bottom,rgba(248,250,252,0.8),rgba(241,245,249,0.5));border-top:1px solid rgba(226,232,240,0.8);padding:2rem}
-@media(min-width:1024px){.amz-elite-faqs{padding:3rem}}
-.amz-elite-faqs-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:2rem}
-.amz-elite-faqs-title{display:flex;align-items:center;gap:16px}
-.amz-elite-faqs-icon{width:48px;height:48px;border-radius:16px;background:linear-gradient(to bottom right,#8b5cf6,#6366f1);display:flex;align-items:center;justify-content:center;box-shadow:0 10px 30px -10px rgba(139,92,246,0.4)}
-.amz-elite-faqs-icon svg{width:20px;height:20px;color:#fff}
-.amz-elite-faqs-text h3{font-size:1.125rem;font-weight:900;color:#0f172a;margin:0 0 4px}
-.amz-elite-faqs-text p{font-size:12px;color:#64748b;margin:0}
-.amz-elite-faqs-count{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:2px;color:#94a3b8;background:#fff;padding:8px 16px;border-radius:20px;border:1px solid #e2e8f0}
-.amz-elite-faqs-grid{display:grid;gap:1rem}
-@media(min-width:768px){.amz-elite-faqs-grid{grid-template-columns:1fr 1fr}}
-.amz-faq{background:#fff;border-radius:16px;border:1px solid #f1f5f9;padding:1.25rem;display:flex;align-items:flex-start;gap:1rem;transition:all 0.3s}
-.amz-faq:hover{border-color:#c7d2fe;box-shadow:0 10px 30px -10px rgba(99,102,241,0.1)}
-.amz-faq-num{width:32px;height:32px;border-radius:10px;background:linear-gradient(to bottom right,#3b82f6,#6366f1);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:10px;font-weight:900;color:#fff}
-.amz-faq-content h4{font-size:13px;font-weight:800;color:#0f172a;margin:0 0 8px;line-height:1.4}
-.amz-faq-content p{font-size:12px;color:#64748b;margin:0;line-height:1.6;padding-left:12px;border-left:2px solid #dbeafe}
-.amz-elite-trust{margin-top:1.5rem;display:flex;flex-wrap:wrap;justify-content:center;gap:1.5rem}
-.amz-elite-trust-item{display:flex;align-items:center;gap:8px;color:#94a3b8;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;transition:color 0.3s}
-.amz-elite-trust-item:hover{color:#64748b}
-.amz-elite-trust-item svg{width:14px;height:14px}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+.amz-bento-v4{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:1000px;margin:5rem auto;position:relative;color:#0f172a;line-height:1.5}
+.amz-bento-container{background:#fff;border-radius:48px;border:1px solid #f1f5f9;box-shadow:0 1px 2px rgba(0,0,0,0.05),0 20px 80px -20px rgba(0,0,0,0.08);overflow:hidden;transition:all 0.6s cubic-bezier(0.4,0,0.2,1)}
+.amz-bento-container:hover{box-shadow:0 30px 100px -20px rgba(0,0,0,0.12);border-color:#e2e8f0}
+.amz-bento-grid{display:grid;grid-template-columns:1fr;gap:0}
+@media(min-width:1024px){.amz-bento-grid{grid-template-columns:45% 55%}}
+.amz-bento-visual{background:linear-gradient(145deg,#f8fafc,#ffffff);padding:3rem;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;border-bottom:1px solid #f1f5f9}
+@media(min-width:1024px){.amz-bento-visual{border-bottom:0;border-right:1px solid #f1f5f9;padding:4rem}}
+.amz-bento-badge{position:absolute;top:2rem;left:2rem;background:#0f172a;color:#fff;font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:2px;padding:8px 20px;border-radius:100px;box-shadow:0 10px 20px rgba(0,0,0,0.1)}
+.amz-bento-img-wrap{width:100%;max-width:320px;aspect-ratio:1;display:flex;align-items:center;justify-content:center;position:relative;margin:2rem 0}
+.amz-bento-img-wrap img{max-width:100%;max-height:100%;object-fit:contain;filter:drop-shadow(0 30px 60px rgba(0,0,0,0.12));transition:all 0.8s cubic-bezier(0.4,0,0.2,1)}
+.amz-bento-container:hover .amz-bento-img-wrap img{transform:scale(1.08) translateY(-10px) rotate(2deg)}
+.amz-bento-rating-pill{background:#fff;border:1px solid #f1f5f9;padding:10px 20px;border-radius:100px;display:flex;align-items:center;gap:12px;box-shadow:0 4px 12px rgba(0,0,0,0.03);margin-top:2rem}
+.amz-bento-stars{color:#fbbf24;font-size:14px}
+.amz-bento-rating-val{font-size:13px;font-weight:800;color:#0f172a}
+.amz-bento-content{padding:3rem;display:flex;flex-direction:column}
+@media(min-width:1024px){.amz-bento-content{padding:4rem}}
+.amz-bento-meta{display:flex;align-items:center;gap:12px;margin-bottom:1.5rem}
+.amz-bento-cat{font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:2px;color:#6366f1;background:#eef2ff;padding:6px 16px;border-radius:100px}
+.amz-bento-prime{font-size:10px;font-weight:800;color:#16a34a;display:flex;align-items:center;gap:4px}
+.amz-bento-title{font-size:2.25rem;font-weight:900;color:#0f172a;line-height:1.1;letter-spacing:-1px;margin:0 0 1.5rem}
+.amz-bento-verdict{font-size:1.125rem;font-weight:500;color:#475569;line-height:1.6;margin-bottom:2.5rem;padding-left:1.5rem;border-left:4px solid #f1f5f9}
+.amz-bento-features{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:3rem}
+@media(max-width:640px){.amz-bento-features{grid-template-columns:1fr}}
+.amz-bento-feature{display:flex;align-items:center;gap:12px}
+.amz-bento-check{width:24px;height:24px;background:#10b981;color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.amz-bento-check svg{width:12px;height:12px}
+.amz-bento-feature span{font-size:14px;font-weight:700;color:#334155}
+.amz-bento-footer{margin-top:auto;display:flex;align-items:center;justify-content:space-between;gap:2rem;padding-top:2.5rem;border-top:1px solid #f1f5f9}
+.amz-bento-price-box{display:flex;flex-direction:column}
+.amz-bento-price-label{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:2px;color:#94a3b8;margin-bottom:4px}
+.amz-bento-price{font-size:3rem;font-weight:900;color:#0f172a;letter-spacing:-2px;line-height:1}
+.amz-bento-btn{background:#0f172a;color:#fff!important;text-decoration:none!important;padding:1.5rem 3rem;border-radius:24px;font-size:14px;font-weight:900;text-transform:uppercase;letter-spacing:2px;transition:all 0.3s;display:inline-flex;align-items:center;gap:12px;box-shadow:0 20px 40px -10px rgba(15,23,42,0.3)}
+.amz-bento-btn:hover{background:#2563eb;transform:translateY(-4px);box-shadow:0 25px 50px -10px rgba(37,99,235,0.4)}
+.amz-bento-faqs{background:#f8fafc;padding:3rem;border-top:1px solid #f1f5f9}
+@media(min-width:1024px){.amz-bento-faqs{padding:4rem}}
+.amz-bento-faqs-title{font-size:1.25rem;font-weight:900;margin-bottom:2rem;display:flex;align-items:center;gap:12px}
+.amz-bento-faqs-grid{display:grid;grid-template-columns:1fr 1fr;gap:2rem}
+@media(max-width:768px){.amz-bento-faqs-grid{grid-template-columns:1fr}}
+.amz-bento-faq-item h4{font-size:14px;font-weight:800;margin:0 0 8px;color:#0f172a}
+.amz-bento-faq-item p{font-size:13px;color:#64748b;margin:0}
+.amz-bento-faq-icon{width:20px;height:20px;background:#e2e8f0;color:#64748b;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:900;margin-right:8px}
 </style>
-<div class="amz-elite-v3">
-  <div class="amz-elite-card">
-    <div class="amz-elite-badge">
-      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
-      Editor's Choice
-    </div>
-    <div class="amz-elite-grid">
-      <div class="amz-elite-visual">
-        <div class="amz-elite-rating">
-          <span class="amz-elite-rating-stars">${'★'.repeat(stars)}${'☆'.repeat(5-stars)}</span>
-          <span class="amz-elite-rating-count">${product.reviewCount || '2.4k'} reviews</span>
+<div class="amz-bento-v4">
+  <div class="amz-bento-container">
+    <div class="amz-bento-grid">
+      <div class="amz-bento-visual">
+        <div class="amz-bento-badge">Top Pick</div>
+        <div class="amz-bento-img-wrap">
+          <img src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.title)}" loading="lazy" />
         </div>
-        <a href="${link}" target="_blank" rel="nofollow sponsored noopener" class="amz-elite-img-wrap">
-          <img src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.title)}" class="amz-elite-img" loading="lazy" />
-        </a>
-        <div class="amz-elite-brand">
-          <span>Official ${escapeHtml(product.brand || 'Brand')} Product</span>
+        <div class="amz-bento-rating-pill">
+          <div class="amz-bento-stars">${'★'.repeat(stars)}${'☆'.repeat(5-stars)}</div>
+          <div class="amz-bento-rating-val">${product.rating || '4.9'} / 5.0</div>
         </div>
       </div>
-      <div class="amz-elite-content">
-        <div class="amz-elite-header">
-          <div class="amz-elite-cats">
-            <span class="amz-elite-cat">${escapeHtml(product.category || 'Premium Selection')}</span>
-            ${product.prime ? '<span class="amz-elite-ship">✓ Free Delivery</span>' : ''}
-          </div>
-          <h2 class="amz-elite-title">${escapeHtml(product.title)}</h2>
-          <div class="amz-elite-quote">
-            <p>${escapeHtml(product.verdict || 'Engineered for excellence. This product represents the pinnacle of design innovation and functional superiority.')}</p>
-          </div>
-          <div class="amz-bullets">${bulletsHtml}</div>
+      <div class="amz-bento-content">
+        <div class="amz-bento-meta">
+          <span class="amz-bento-cat">${escapeHtml(product.category || 'Premium')}</span>
+          ${product.prime ? '<span class="amz-bento-prime"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Prime Shipping</span>' : ''}
         </div>
-        <div class="amz-elite-action">
-          <div class="amz-elite-price-wrap">
-            <div class="amz-elite-price-meta">
-              <span class="amz-elite-price-label">Best Price</span>
-              <span class="amz-elite-price-save">Save Today</span>
-            </div>
-            <div class="amz-elite-price">${escapeHtml(product.price)}</div>
+        <h2 class="amz-bento-title">${escapeHtml(product.title)}</h2>
+        <div class="amz-bento-verdict">
+          <p>${escapeHtml(product.verdict || 'A masterclass in design and engineering, offering unparalleled performance for demanding users.')}</p>
+        </div>
+        <div class="amz-bento-features">${bulletsHtml}</div>
+        <div class="amz-bento-footer">
+          <div class="amz-bento-price-box">
+            <span class="amz-bento-price-label">Best Price</span>
+            <div class="amz-bento-price">${escapeHtml(product.price)}</div>
           </div>
-          <div class="amz-elite-btn-wrap">
-            <div class="amz-elite-btn-glow"></div>
-            <a href="${link}" target="_blank" rel="nofollow sponsored noopener" class="amz-elite-btn">
-              <span>Check Price</span>
-              <div class="amz-elite-btn-icon">→</div>
-            </a>
-          </div>
+          <a href="${link}" target="_blank" rel="nofollow sponsored noopener" class="amz-bento-btn">
+            Check Price
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+          </a>
         </div>
       </div>
     </div>
-    <div class="amz-elite-faqs">
-      <div class="amz-elite-faqs-header">
-        <div class="amz-elite-faqs-title">
-          <div class="amz-elite-faqs-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-          </div>
-          <div class="amz-elite-faqs-text">
-            <h3>Frequently Asked Questions</h3>
-            <p>Quick answers about this product</p>
-          </div>
-        </div>
-        <span class="amz-elite-faqs-count">${faqs.length} FAQs</span>
-      </div>
-      <div class="amz-elite-faqs-grid">${faqsHtml}</div>
+    <div class="amz-bento-faqs">
+      <h3 class="amz-bento-faqs-title">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        Common Questions
+      </h3>
+      <div class="amz-bento-faqs-grid">${faqsHtml}</div>
     </div>
-  </div>
-  <div class="amz-elite-trust">
-    <span class="amz-elite-trust-item"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg> Amazon Verified</span>
-    <span class="amz-elite-trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> Secure Checkout</span>
-    <span class="amz-elite-trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> 30-Day Returns</span>
-    <span class="amz-elite-trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg> Fast Shipping</span>
   </div>
 </div>
 <!-- /wp:html -->`;
-};
+  };
 
 
 // ============================================================================
@@ -1308,162 +1229,106 @@ const cleanAndParseJSON = (text: string): { products: any[]; comparison: any } =
 interface ExtractedProduct {
   asin: string;
   name: string;
-  source: 'amazon_link' | 'amazon_anchor' | 'schema' | 'review_box' | 'brand_model' | 'link' | 'heading' | 'list' | 'text';
+  source: 'link' | 'heading' | 'list' | 'text';
   confidence: number;
 }
+
+const FORBIDDEN_PRODUCT_WORDS = [
+  'privacy policy', 'terms of service', 'contact us', 'about us', 'disclaimer',
+  'affiliate disclosure', 'cookie policy', 'sitemap', 'home', 'blog', 'search',
+  'menu', 'navigation', 'footer', 'header', 'sidebar', 'comment', 'reply',
+  'share', 'facebook', 'twitter', 'instagram', 'pinterest', 'youtube',
+  'newsletter', 'subscribe', 'login', 'register', 'account', 'cart', 'checkout',
+  'read more', 'click here', 'view on amazon', 'check price', 'buy now'
+];
 
 const preExtractAmazonProducts = (html: string): ExtractedProduct[] => {
   const products: ExtractedProduct[] = [];
   const seenAsins = new Set<string>();
   const seenNames = new Set<string>();
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STRATEGY 1: Extract ASINs from Amazon URLs (HIGHEST CONFIDENCE - 100% accurate)
-  // These are GUARANTEED to be real products mentioned in the post
-  // ═══════════════════════════════════════════════════════════════════════════
+  const isForbidden = (text: string) => {
+    const lower = text.toLowerCase();
+    return FORBIDDEN_PRODUCT_WORDS.some(word => lower.includes(word)) || text.length < 5;
+  };
+
+  // STRATEGY 1: Extract ASINs from Amazon URLs (highest confidence)
   const asinPatterns = [
     /amazon\.com\/(?:dp|gp\/product|exec\/obidos\/ASIN)\/([A-Z0-9]{10})/gi,
     /amazon\.com\/[^"'\s]*\/dp\/([A-Z0-9]{10})/gi,
     /amazon\.com\/[^"'\s]*?(?:\/|%2F)([A-Z0-9]{10})(?:[/?&"'\s]|$)/gi,
+    /amzn\.to\/([A-Za-z0-9]+)/gi,
     /data-asin=["']([A-Z0-9]{10})["']/gi,
-    /asin["':\s]*=?\s*["']?([A-Z0-9]{10})["']?/gi,
-    /tag=[\w\-]+&.*?(?:asin|ASIN)=([A-Z0-9]{10})/gi,
+    /asin["':\s]+["']?([A-Z0-9]{10})["']?/gi,
   ];
 
   for (const pattern of asinPatterns) {
     let match;
     while ((match = pattern.exec(html)) !== null) {
-      const asin = match[1]?.toUpperCase();
-      if (asin && asin.length === 10 && /^[A-Z0-9]+$/.test(asin) && !seenAsins.has(asin)) {
+      const asin = match[1].toUpperCase();
+      if (asin.length === 10 && /^[A-Z0-9]+$/.test(asin) && !seenAsins.has(asin)) {
         seenAsins.add(asin);
-        products.push({ asin, name: '', source: 'amazon_link', confidence: 1.0 });
+        products.push({ asin, name: '', source: 'link', confidence: 1.0 });
       }
     }
   }
-  
-  // Handle amzn.to short links separately (mark as needing resolution)
-  const shortLinkPattern = /amzn\.to\/([a-zA-Z0-9]+)/gi;
-  let shortMatch;
-  while ((shortMatch = shortLinkPattern.exec(html)) !== null) {
-    const shortCode = shortMatch[1];
-    if (shortCode && !seenAsins.has(`SHORT_${shortCode}`)) {
-      seenAsins.add(`SHORT_${shortCode}`);
-      // Add as placeholder - will be resolved via Amazon API later
-      products.push({ asin: '', name: `amzn.to/${shortCode}`, source: 'amazon_link', confidence: 0.98 });
-    }
-  }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STRATEGY 2: Extract product names from Amazon link anchor text
-  // Link text is usually the product name - very high confidence
-  // ═══════════════════════════════════════════════════════════════════════════
-  const amazonLinkPattern = /<a[^>]*href=["'][^"']*(?:amazon\.com|amzn\.to)[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi;
+  // STRATEGY 2: Extract product names from Amazon link text
+  const linkTextPattern = /<a[^>]*amazon\.com[^>]*>([^<]{5,120})<\/a>/gi;
   let linkMatch;
-  while ((linkMatch = amazonLinkPattern.exec(html)) !== null) {
-    // Strip HTML tags from anchor content
-    const rawText = linkMatch[1].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-    
-    // Filter out generic text like "Check Price", "Buy Now", "Amazon", "Click Here"
-    const genericPhrases = /^(check|buy|view|see|get|click|amazon|price|here|now|shop|order|purchase|\$[\d.]+)/i;
-    
-    if (rawText.length >= 10 && rawText.length <= 150 && !genericPhrases.test(rawText) && !seenNames.has(rawText.toLowerCase())) {
-      seenNames.add(rawText.toLowerCase());
-      products.push({ asin: '', name: rawText, source: 'amazon_anchor', confidence: 0.95 });
+  while ((linkMatch = linkTextPattern.exec(html)) !== null) {
+    const name = linkMatch[1].trim().replace(/\s+/g, ' ');
+    if (name.length > 8 && !isForbidden(name) && !seenNames.has(name.toLowerCase())) {
+      seenNames.add(name.toLowerCase());
+      products.push({ asin: '', name, source: 'link', confidence: 0.95 });
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STRATEGY 3: Extract from structured data (JSON-LD, Schema.org)
-  // Websites often include product schema - extremely reliable
-  // ═══════════════════════════════════════════════════════════════════════════
-  const schemaPatterns = [
-    /"@type"\s*:\s*"Product"[^}]*"name"\s*:\s*"([^"]+)"/gi,
-    /"name"\s*:\s*"([^"]+)"[^}]*"@type"\s*:\s*"Product"/gi,
-    /itemprop=["']name["'][^>]*>([^<]{5,100})</gi,
-  ];
-  
-  for (const pattern of schemaPatterns) {
-    let match;
-    while ((match = pattern.exec(html)) !== null) {
-      const name = match[1].trim().replace(/\\"/g, '"');
-      if (name.length >= 5 && name.length <= 120 && !seenNames.has(name.toLowerCase())) {
-        seenNames.add(name.toLowerCase());
-        products.push({ asin: '', name, source: 'schema', confidence: 0.92 });
+  // STRATEGY 3: Extract from headings with product indicators
+  const headingPattern = /<h[1-4][^>]*>([^<]*(?:Best|Top|Review|Pick|Choice|Recommended|Editor|Winner|#\d|Overall|Budget|Premium)[^<]*)<\/h[1-4]>/gi;
+  let headingMatch;
+  while ((headingMatch = headingPattern.exec(html)) !== null) {
+    const text = headingMatch[1].replace(/<[^>]*>/g, '').trim();
+    if (text.length > 5 && text.length < 150 && !isForbidden(text) && !seenNames.has(text.toLowerCase())) {
+      // Clean up common listicle prefixes like "1. ", "Best Overall: "
+      const cleanName = text.replace(/^\d+[\.\s\-]+/, '').replace(/^(Best|Top|Winner|Pick|Choice|Recommended|Overall|Budget|Premium)\s*[:\-]*\s*/i, '').trim();
+      if (cleanName.length > 5 && !seenNames.has(cleanName.toLowerCase())) {
+        seenNames.add(cleanName.toLowerCase());
+        products.push({ asin: '', name: cleanName, source: 'heading', confidence: 0.85 });
       }
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STRATEGY 4: Extract from product review boxes/widgets
-  // These usually have specific class names or data attributes
-  // ═══════════════════════════════════════════════════════════════════════════
-  const reviewBoxPatterns = [
-    /class=["'][^"']*(?:product|review|affiliate)[^"']*["'][^>]*>[\s\S]*?<(?:h[1-4]|strong|b)[^>]*>([^<]{5,100})<\//gi,
-    /data-product[^>]*>([^<]{5,100})</gi,
-    /class=["'][^"']*product-?title[^"']*["'][^>]*>([^<]{5,100})</gi,
-  ];
-  
-  for (const pattern of reviewBoxPatterns) {
-    let match;
-    while ((match = pattern.exec(html)) !== null) {
-      const name = match[1].replace(/<[^>]*>/g, '').trim();
-      if (name.length >= 5 && name.length <= 120 && !seenNames.has(name.toLowerCase())) {
-        seenNames.add(name.toLowerCase());
-        products.push({ asin: '', name, source: 'review_box', confidence: 0.88 });
+  // STRATEGY 4: Extract from numbered/bulleted lists (more strict)
+  const listPattern = /<li[^>]*>(?:<[^>]*>)*([^<]*(?:[A-Z][a-z]+\s+[A-Z][a-z]+)[^<]{10,100})(?:<[^>]*>)*<\/li>/gi;
+  let listMatch;
+  while ((listMatch = listPattern.exec(html)) !== null) {
+    const text = listMatch[1].replace(/<[^>]*>/g, '').trim();
+    if (text.length > 15 && text.length < 100 && !isForbidden(text) && !seenNames.has(text.toLowerCase())) {
+      const hasProductIndicator = /\b(pro|plus|max|ultra|mini|lite|series|gen|edition|version|\d{3,4}[a-z]*|v\d+|mk\s*\d+)\b/i.test(text);
+      if (hasProductIndicator) {
+        seenNames.add(text.toLowerCase());
+        products.push({ asin: '', name: text, source: 'list', confidence: 0.7 });
       }
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STRATEGY 5: Extract SPECIFIC brand+model combinations
-  // Only high-confidence patterns with model numbers or series names
-  // ═══════════════════════════════════════════════════════════════════════════
-  const strictBrandModelPattern = /\b(Apple|Samsung|Sony|LG|Bose|JBL|Anker|Logitech|Razer|Corsair|HyperX|SteelSeries|Ninja|Instant\s?Pot|KitchenAid|Cuisinart|Dyson|iRobot|Roomba|Shark|Vitamix|Breville|De'?Longhi|Keurig|Nespresso|GoPro|Canon|Nikon|Fujifilm|DJI|Ring|Nest|Arlo|Philips|Oral-B|Waterpik|Fitbit|Garmin|Whoop|Oura|Theragun|Hyperice|NordicTrack|Peloton|Bowflex|RENPHO|Wyze|TP-Link|Netgear|Asus|Dell|HP|Lenovo|Microsoft|Surface|Google|Amazon|Echo|Kindle|Fire|AirPods?|MacBook|iPhone|iPad|Galaxy|Pixel|PlayStation|Xbox|Nintendo|Switch|Roku|Sonos)\s+((?:Pro|Max|Ultra|Plus|Mini|Lite|Air|SE|Studio|Series\s*\d*|Gen\s*\d*|Edition|[A-Z]{1,3}[\-\s]?\d{2,4}[A-Za-z]*|[\w\-]+\s+[\w\-]+))/gi;
+  // STRATEGY 5: Extract brand + model patterns from text (expanded list)
+  const brandModelPattern = /\b(Apple|Samsung|Sony|LG|Bose|JBL|Anker|Logitech|Razer|Corsair|HyperX|SteelSeries|Ninja|Instant Pot|KitchenAid|Cuisinart|Dyson|iRobot|Roomba|Shark|Vitamix|Breville|De'?Longhi|Keurig|Nespresso|GoPro|Canon|Nikon|Fujifilm|DJI|Ring|Nest|Arlo|Philips|Oral-B|Waterpik|Fitbit|Garmin|Whoop|Oura|Theragun|Hyperice|NordicTrack|Peloton|Bowflex|RENPHO|Wyze|TP-Link|Netgear|Asus|Dell|HP|Lenovo|Microsoft|Google|Amazon|Echo|Kindle|Fire|Roku|Vizio|TCL|Hisense|Sonos|Marshall|Klipsch|Audio-Technica|Shure|Blue|Yeti|Elgato|Western Digital|Seagate|Crucial|Kingston|Sandisk|Intel|AMD|Nvidia|Gigabyte|MSI|EVGA|Zotac|Asrock|Noctua|Be Quiet|Cooler Master|Thermaltake|NZXT|Fractal Design|Lian Li|Phanteks|Corsair|G.Skill|Teamgroup|Patriot|Sabrent|Samsung|Western Digital|Seagate|Crucial|Kingston|Sandisk)\s+([A-Z0-9][a-z0-9]*\s*[\w\-]+(?:\s+[\w\-]+){0,3})/g;
   
   let brandMatch;
-  while ((brandMatch = strictBrandModelPattern.exec(html)) !== null) {
-    const name = `${brandMatch[1]} ${brandMatch[2]}`.replace(/\s+/g, ' ').trim();
-    
-    // Validate it's a real product (has model number or product modifier)
-    const hasModelIndicator = /(?:Pro|Max|Ultra|Plus|Mini|Lite|Air|SE|Studio|\d{2,4}|Gen|Series|Edition)/i.test(name);
-    
-    if (name.length >= 8 && name.length <= 80 && hasModelIndicator && !seenNames.has(name.toLowerCase())) {
+  while ((brandMatch = brandModelPattern.exec(html)) !== null) {
+    const name = `${brandMatch[1]} ${brandMatch[2]}`.trim();
+    if (name.length > 8 && name.length < 80 && !isForbidden(name) && !seenNames.has(name.toLowerCase())) {
       seenNames.add(name.toLowerCase());
-      products.push({ asin: '', name, source: 'brand_model', confidence: 0.85 });
+      products.push({ asin: '', name, source: 'text', confidence: 0.75 });
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STRATEGY 6: FALLBACK - Extract from listicle headings (lower confidence)
-  // Only if we found few high-confidence products
-  // ═══════════════════════════════════════════════════════════════════════════
-  if (products.length < 3) {
-    // Look for numbered product headings like "1. Sony WH-1000XM5" or "# Best: Apple AirPods Pro"
-    const listicleHeadingPattern = /<h[2-4][^>]*>(?:\s*(?:\d+[\.\):]|\#\d*|Best|Top|Our Pick|Editor|Winner|Choice|Recommended)[^<]*)?([A-Z][^<]{10,80})<\/h[2-4]>/gi;
-    let headingMatch;
-    while ((headingMatch = listicleHeadingPattern.exec(html)) !== null) {
-      const text = headingMatch[1].replace(/<[^>]*>/g, '').trim();
-      
-      // Must contain at least one known brand or look like a product name
-      const hasBrand = /\b(Apple|Samsung|Sony|LG|Bose|JBL|Anker|Logitech|Dyson|iRobot|Roomba|Shark|Ninja|Instant\s?Pot|KitchenAid|Cuisinart|Canon|Nikon|GoPro|DJI|Fitbit|Garmin|Ring|Nest|Dell|HP|Lenovo|Microsoft|Google|Amazon)/i.test(text);
-      const looksLikeProduct = /\b(?:Pro|Max|Ultra|Plus|Mini|Gen|Series|\d{3,4})\b/i.test(text);
-      
-      if (text.length >= 10 && text.length <= 100 && (hasBrand || looksLikeProduct) && !seenNames.has(text.toLowerCase())) {
-        seenNames.add(text.toLowerCase());
-        products.push({ asin: '', name: text, source: 'heading', confidence: 0.65 });
-      }
-    }
-  }
-
-  // Sort by confidence (highest first) and limit to top products
+  // Sort by confidence (highest first)
   products.sort((a, b) => b.confidence - a.confidence);
 
-  console.log(`[preExtract] PRECISION MODE: Found ${products.length} products with high confidence`);
-  console.log(`[preExtract] ASINs: ${seenAsins.size}, Names: ${seenNames.size}`);
-  if (products.length > 0) {
-    console.log(`[preExtract] Top products:`, products.slice(0, 5).map(p => p.asin || p.name));
-  }
-  
+  console.log(`[preExtract] Found ${products.length} potential products:`, products.slice(0, 5));
   return products;
 };
 
@@ -1562,168 +1427,6 @@ const generateDynamicVerdict = (productName: string, brand: string, category: st
 };
 
 // ============================================================================
-// MULTI-PROVIDER AI ENGINE
-// ============================================================================
-
-interface AIResponse {
-  text: string;
-  provider: string;
-}
-
-const callAIProvider = async (
-  config: AppConfig,
-  systemPrompt: string,
-  userPrompt: string
-): Promise<AIResponse | null> => {
-  const provider = config.aiProvider;
-  
-  try {
-    switch (provider) {
-      case 'gemini': {
-        const rawKey = config.geminiApiKey || process.env.API_KEY;
-        const apiKey = rawKey ? SecureStorage.decrypt(rawKey) || rawKey : '';
-        if (!apiKey) throw new Error('Gemini API key not configured');
-        
-        const ai = new GoogleGenAI({ apiKey });
-        const response = await ai.models.generateContent({
-          model: config.aiModel || 'gemini-2.0-flash',
-          contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-          config: {
-            systemInstruction: systemPrompt,
-            responseMimeType: 'application/json',
-          },
-        });
-        return { text: response?.text || '', provider: 'gemini' };
-      }
-
-      case 'openai': {
-        const rawKey = config.openaiApiKey;
-        const apiKey = rawKey ? SecureStorage.decrypt(rawKey) || rawKey : '';
-        if (!apiKey) throw new Error('OpenAI API key not configured');
-        
-        const response = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: config.aiModel || 'gpt-4o',
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt },
-            ],
-            response_format: { type: 'json_object' },
-          }),
-        });
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`OpenAI API error (${response.status}): ${errText.substring(0, 200)}`);
-        }
-        const data = await response.json();
-        if (data.error) throw new Error(data.error.message);
-        return { text: data.choices?.[0]?.message?.content || '', provider: 'openai' };
-      }
-
-      case 'anthropic': {
-        const rawKey = config.anthropicApiKey;
-        const apiKey = rawKey ? SecureStorage.decrypt(rawKey) || rawKey : '';
-        if (!apiKey) throw new Error('Anthropic API key not configured');
-        
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-          },
-          body: JSON.stringify({
-            model: config.aiModel || 'claude-3-5-sonnet-20241022',
-            max_tokens: 4096,
-            system: systemPrompt,
-            messages: [{ role: 'user', content: userPrompt }],
-          }),
-        });
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`Anthropic API error (${response.status}): ${errText.substring(0, 200)}`);
-        }
-        const data = await response.json();
-        if (data.error) throw new Error(data.error.message);
-        return { text: data.content?.[0]?.text || '', provider: 'anthropic' };
-      }
-
-      case 'groq': {
-        const rawKey = config.groqApiKey;
-        const apiKey = rawKey ? SecureStorage.decrypt(rawKey) || rawKey : '';
-        if (!apiKey) throw new Error('Groq API key not configured');
-        
-        const model = config.customModel || 'llama-3.3-70b-versatile';
-        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: 'system', content: systemPrompt + '\n\nRespond with valid JSON only.' },
-              { role: 'user', content: userPrompt },
-            ],
-          }),
-        });
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`Groq API error (${response.status}): ${errText.substring(0, 200)}`);
-        }
-        const data = await response.json();
-        if (data.error) throw new Error(data.error.message);
-        return { text: data.choices?.[0]?.message?.content || '', provider: 'groq' };
-      }
-
-      case 'openrouter': {
-        const rawKey = config.openrouterApiKey;
-        const apiKey = rawKey ? SecureStorage.decrypt(rawKey) || rawKey : '';
-        if (!apiKey) throw new Error('OpenRouter API key not configured');
-        
-        const model = config.customModel || 'anthropic/claude-3.5-sonnet';
-        const siteUrl = typeof window !== 'undefined' ? window.location.origin : 'https://amzpilot.app';
-        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-            'HTTP-Referer': siteUrl,
-            'X-Title': 'AmzPilot',
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: 'system', content: systemPrompt + '\n\nRespond with valid JSON only.' },
-              { role: 'user', content: userPrompt },
-            ],
-          }),
-        });
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`OpenRouter API error (${response.status}): ${errText.substring(0, 200)}`);
-        }
-        const data = await response.json();
-        if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
-        return { text: data.choices?.[0]?.message?.content || '', provider: 'openrouter' };
-      }
-
-      default:
-        throw new Error(`Unknown AI provider: ${provider}`);
-    }
-  } catch (error: any) {
-    console.error(`[AI] ${provider} error:`, error.message);
-    throw error;
-  }
-};
-
-// ============================================================================
 // ULTRA-RELIABLE AI ANALYSIS ENGINE
 // ============================================================================
 
@@ -1735,6 +1438,7 @@ export const analyzeContentAndFindProduct = async (
   detectedProducts: ProductDetails[];
   product: ProductDetails | null;
   comparison?: ComparisonData;
+  carousel?: CarouselData;
 }> => {
   console.log('[SCAN] Starting ultra-reliable product detection...');
   console.log('[SCAN] Title:', title);
@@ -1758,12 +1462,14 @@ export const analyzeContentAndFindProduct = async (
   // STEP 2: AI ENHANCEMENT (Optional - improves results but not required)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  const hasAnyApiKey = config.geminiApiKey || config.openaiApiKey || config.anthropicApiKey || 
-                       config.groqApiKey || config.openrouterApiKey || process.env.API_KEY;
+  const apiKey = process.env.API_KEY;
   let aiProducts: any[] = [];
 
-  if (hasAnyApiKey) {
+  if (apiKey) {
     try {
+      const ai = new GoogleGenAI({ apiKey });
+      
+      // Clean content for AI
       const context = (htmlContent || '')
         .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
         .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
@@ -1772,43 +1478,47 @@ export const analyzeContentAndFindProduct = async (
         .trim()
         .substring(0, 20000);
 
-      const systemPrompt = `TASK: Extract ONLY the specific products that are EXPLICITLY mentioned in this blog post.
+      const systemPrompt = `TASK: You are a world-class product extraction engine. Your goal is to identify ONLY the actual products being reviewed, compared, or discussed as primary subjects in the provided blog post.
 
-CRITICAL RULES FOR ACCURACY:
-1. ONLY include products that are EXPLICITLY named in the content - do NOT infer or guess
-2. The product name MUST appear VERBATIM in the content (you must be able to quote it)
-3. Do NOT include generic category mentions (e.g., "a good vacuum" is NOT a product)
-4. Do NOT hallucinate or make up products that aren't mentioned
-5. If NO products are explicitly named, return {"products":[]}
+STRICT RULES:
+1. ONLY extract physical products that can be purchased on Amazon.
+2. IGNORE generic mentions, accessories (unless they are the main topic), and non-product entities.
+3. IGNORE navigation links, site meta-text, and boilerplate.
+4. If the post is a "Best [Category]" list, extract each item in the list.
+5. If the post is a single product review, extract only that product.
+6. For each product, provide a high-confidence "productName" and "brand".
+7. Ensure the "verdict" is specific and high-quality.
 
-ALREADY DETECTED FROM HTML (verify these are mentioned):
+HINTS - Products already detected in this page:
 - ASINs found: ${asinsFound.join(', ') || 'none'}
-- Product names detected: ${namesFound.slice(0, 10).join(', ') || 'none'}
+- Product names found: ${namesFound.slice(0, 10).join(', ') || 'none'}
 
-For EACH verified product provide:
-{
-  "productName": "EXACT name as written in the content",
-  "exactQuote": "The exact sentence where this product is mentioned",
-  "brand": "Brand/manufacturer",
-  "category": "Product category"
-}
+OUTPUT FORMAT:
+Return a JSON object with a "products" array. Each product must have:
+- productName: The full, precise name of the product.
+- brand: The manufacturer or brand name.
+- category: A specific category (e.g., "Noise Cancelling Headphones").
+- verdict: EXACTLY 3 sentences. 
+  Sentence 1: "[Power word] for [user type], the [Brand] [Product] [main benefit]"
+  Sentence 2: "[Key feature with specific detail], [performance claim]"
+  Sentence 3: "[Trust signal], backed by [warranty/reviews]"
+- confidence: A number from 0.0 to 1.0 indicating how certain you are this is a primary product of the post.
 
-VERIFICATION: Before adding a product, ask yourself:
-- Can I point to the EXACT sentence where this product is named? If NO, don't include it.
-- Is this a SPECIFIC product (brand + model) or just a category? If category, don't include it.
+Return JSON: {"products": [...]}`;
 
-Return ONLY verified products as JSON: {"products":[...]}`;
+      const response = await ai.models.generateContent({
+        model: config.aiModel || 'gemini-2.0-flash',
+        contents: [{ role: 'user', parts: [{ text: `Title: "${title}"\n\nContent: ${context}` }] }],
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+        },
+      });
 
-      const userPrompt = `Title: "${title}"\n\nContent: ${context}`;
-      
-      console.log(`[SCAN] Using AI provider: ${config.aiProvider}`);
-      const response = await callAIProvider(config, systemPrompt, userPrompt);
-
-      if (response) {
-        const data = cleanAndParseJSON(response.text);
-        aiProducts = data.products || [];
-        console.log(`[SCAN] ${response.provider} found ${aiProducts.length} additional products`);
-      }
+      const data = cleanAndParseJSON(response?.text || '');
+      // Filter by confidence
+      aiProducts = (data.products || []).filter((p: any) => (p.confidence || 0) >= 0.7);
+      console.log(`[SCAN] AI found ${aiProducts.length} high-confidence products`);
       
     } catch (e: any) {
       console.warn('[SCAN] AI enhancement failed, using pre-extracted only:', e.message);
@@ -1821,9 +1531,12 @@ Return ONLY verified products as JSON: {"products":[...]}`;
 
   const allProducts: Map<string, { asin: string; name: string; brand: string; category: string; verdict: string }> = new Map();
 
+  // Helper to normalize names for better deduplication
+  const normalizeForMap = (name: string) => name.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 40);
+
   // Add pre-extracted products (highest priority - from actual Amazon links)
   for (const p of preExtracted) {
-    const key = p.asin || p.name.toLowerCase().substring(0, 30);
+    const key = p.asin || normalizeForMap(p.name);
     if (!allProducts.has(key)) {
       allProducts.set(key, {
         asin: p.asin,
@@ -1835,76 +1548,36 @@ Return ONLY verified products as JSON: {"products":[...]}`;
     }
   }
 
-  // Prepare content for validation (strip HTML, lowercase for matching)
-  const contentForValidation = (htmlContent || '')
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .toLowerCase();
-
   // Add AI products (merge data if exists, add new if not)
-  // CRITICAL: Validate that each AI product is ACTUALLY mentioned in the content
   for (const p of aiProducts) {
     if (!p.productName) continue;
     
-    const productNameLower = p.productName.toLowerCase();
-    
-    // ═══════════════════════════════════════════════════════════════════════════
-    // VALIDATION: Verify product is actually mentioned in content
-    // ═══════════════════════════════════════════════════════════════════════════
-    const productWords = productNameLower.split(/\s+/).filter((w: string) => w.length > 2);
-    const significantWords = productWords.filter((w: string) => 
-      !['the', 'and', 'for', 'with', 'pro', 'max', 'plus', 'edition'].includes(w)
-    );
-    
-    // Check if significant words appear in content
-    const matchingWords = significantWords.filter((word: string) => contentForValidation.includes(word));
-    const matchRatio = significantWords.length > 0 ? matchingWords.length / significantWords.length : 0;
-    
-    // Also check for exact phrase match (most reliable)
-    const hasExactMatch = contentForValidation.includes(productNameLower);
-    
-    // Check if brand is mentioned (optional but boosts confidence)
-    const brandLower = (p.brand || '').toLowerCase();
-    const hasBrandMention = brandLower.length > 2 && contentForValidation.includes(brandLower);
-    
-    // More lenient validation:
-    // - Exact match: always accept
-    // - 50%+ word match with brand: accept
-    // - 70%+ word match without brand: accept (brand might be abbreviated)
-    // - Has exactQuote from AI: trust the AI's verification
-    const hasAIQuote = p.exactQuote && p.exactQuote.length > 10;
-    const isValidated = hasExactMatch || 
-                        (matchRatio >= 0.5 && hasBrandMention) || 
-                        (matchRatio >= 0.7) ||
-                        (hasAIQuote && matchRatio >= 0.4);
-    
-    if (!isValidated) {
-      console.log(`[SCAN] REJECTED AI product "${p.productName}" - not found in content (match ratio: ${(matchRatio * 100).toFixed(0)}%, brand: ${hasBrandMention})`);
-      continue;
-    }
-    
-    console.log(`[SCAN] VALIDATED AI product "${p.productName}" - found in content (match: ${(matchRatio * 100).toFixed(0)}%)`);
-    
-    const key = productNameLower.substring(0, 30);
+    const key = normalizeForMap(p.productName);
     const existing = allProducts.get(key);
     
     if (existing) {
       // Merge AI data into existing
+      existing.name = existing.name || p.productName;
       existing.brand = existing.brand || p.brand || '';
       existing.category = existing.category || p.category || '';
       existing.verdict = existing.verdict || p.verdict || '';
     } else {
-      // Check if this matches any ASIN entry by name similarity
+      // Check if this matches any ASIN entry by name similarity (more robust)
       let matched = false;
-      for (const [, v] of allProducts) {
-        if (v.asin && !v.name && p.productName) {
-          // This could be the name for an ASIN we found
-          v.name = p.productName;
-          v.brand = p.brand || '';
-          v.category = p.category || '';
-          v.verdict = p.verdict || '';
-          matched = true;
-          break;
+      const pNameLower = p.productName.toLowerCase();
+      
+      for (const [_, v] of allProducts) {
+        if (v.asin && (!v.name || v.name.length < 10)) {
+          // If we have an ASIN but no good name, and AI found a name that might match
+          // (Simple heuristic: if brand is in the name or name is in the AI name)
+          if (pNameLower.includes(v.asin.toLowerCase()) || (v.name && pNameLower.includes(v.name.toLowerCase()))) {
+            v.name = p.productName;
+            v.brand = p.brand || '';
+            v.category = p.category || '';
+            v.verdict = p.verdict || '';
+            matched = true;
+            break;
+          }
         }
       }
       
@@ -1988,15 +1661,24 @@ Return ONLY verified products as JSON: {"products":[...]}`;
 
   console.log(`[SCAN] COMPLETE - Found ${processed.length} products`);
 
+  let carousel: CarouselData | undefined = undefined;
+  if (processed.length >= 4) {
+    carousel = {
+      title: `Top Rated ${processed[0].category || 'Products'}`,
+      productIds: processed.slice(0, 8).map(p => p.id)
+    };
+  }
+
   if (processed.length > 0) {
     const contentHash = generateContentHash(title, htmlContent.length);
-    IntelligenceCache.setAnalysis(contentHash, { products: processed, comparison: undefined });
+    IntelligenceCache.setAnalysis(contentHash, { products: processed, comparison: undefined, carousel });
   }
 
   return {
     detectedProducts: processed,
     product: processed[0] || null,
     comparison: undefined,
+    carousel,
   };
 };
 
@@ -2069,160 +1751,8 @@ export const insertIntoContent = (
 };
 
 // ============================================================================
-// AMAZON PRODUCT SEARCH - WITH ULTRA-SMART CACHING
+// AMAZON PRODUCT SEARCH
 // ============================================================================
-
-// Global SerpAPI cache to minimize API calls (persisted in sessionStorage)
-const SerpApiCache = {
-  _cache: new Map<string, { data: ProductDetails; timestamp: number }>(),
-  _initialized: false,
-  
-  _init() {
-    if (this._initialized) return;
-    this._initialized = true;
-    try {
-      const stored = sessionStorage.getItem('serpapi_cache_v2');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        Object.entries(parsed).forEach(([key, value]: [string, any]) => {
-          if (value && value.timestamp && Date.now() - value.timestamp < 24 * 60 * 60 * 1000) {
-            this._cache.set(key, value);
-          }
-        });
-        console.log(`[SerpAPI] Loaded ${this._cache.size} cached products`);
-      }
-    } catch (e) { /* ignore */ }
-  },
-  
-  get(asin: string): ProductDetails | null {
-    this._init();
-    const entry = this._cache.get(asin);
-    if (entry && Date.now() - entry.timestamp < 24 * 60 * 60 * 1000) {
-      console.log(`[SerpAPI] CACHE HIT for ${asin}`);
-      return { ...entry.data, id: `cached-${asin}-${Date.now()}` };
-    }
-    return null;
-  },
-  
-  set(asin: string, data: ProductDetails): void {
-    this._init();
-    this._cache.set(asin, { data, timestamp: Date.now() });
-    try {
-      const obj: Record<string, any> = {};
-      this._cache.forEach((v, k) => { obj[k] = v; });
-      sessionStorage.setItem('serpapi_cache_v2', JSON.stringify(obj));
-    } catch (e) { /* ignore */ }
-  },
-  
-  getStats(): { hits: number; size: number } {
-    return { hits: 0, size: this._cache.size };
-  }
-};
-
-export const fetchProductByASIN = async (
-  asin: string,
-  apiKey: string
-): Promise<ProductDetails | null> => {
-  if (!asin || asin.length !== 10) {
-    console.warn('[fetchProductByASIN] Invalid ASIN:', asin);
-    return null;
-  }
-
-  // Check cache first to avoid unnecessary API calls
-  const cached = SerpApiCache.get(asin);
-  if (cached) {
-    return cached;
-  }
-
-  if (!apiKey) {
-    return {
-      id: `manual-${asin}-${Date.now()}`,
-      asin,
-      title: `Amazon Product (${asin})`,
-      brand: '',
-      category: '',
-      price: 'Check Price',
-      imageUrl: `https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN=${asin}&Format=_SL250_&ID=AsinImage&ServiceVersion=20070822&WS=1`,
-      rating: 4.5,
-      reviewCount: 100,
-      prime: true,
-      faqs: [],
-      entities: [],
-      evidenceClaims: [],
-      insertionIndex: -1,
-      deploymentMode: 'ELITE_BENTO',
-    };
-  }
-
-  try {
-    const productApiUrl = `https://serpapi.com/search.json?engine=amazon_product&asin=${asin}&api_key=${apiKey}`;
-    const detailResponse = await fetchWithProxy(productApiUrl);
-    const detailData = JSON.parse(detailResponse);
-    const product = detailData.product_results || {};
-
-    let finalImage = '';
-    if (product.images?.length > 0) {
-      finalImage = typeof product.images[0] === 'string' 
-        ? product.images[0] 
-        : product.images[0].link;
-    } else if (product.images_flat?.length > 0) {
-      finalImage = product.images_flat[0];
-    } else if (product.main_image?.link) {
-      finalImage = product.main_image.link;
-    }
-
-    if (finalImage) {
-      finalImage = finalImage.replace(/\._AC_.*_\./, '._AC_SL1500_.');
-    }
-
-    if (!finalImage) {
-      finalImage = `https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN=${asin}&Format=_SL250_&ID=AsinImage&ServiceVersion=20070822&WS=1`;
-    }
-
-    const result: ProductDetails = {
-      id: `manual-${asin}-${Date.now()}`,
-      asin: product.asin || asin,
-      title: product.title || `Amazon Product (${asin})`,
-      brand: product.brand || '',
-      category: product.category || '',
-      price: product.price || 'Check Price',
-      imageUrl: finalImage,
-      rating: product.rating || 4.5,
-      reviewCount: product.reviews_count || 100,
-      prime: product.prime || true,
-      faqs: [],
-      entities: [],
-      evidenceClaims: [],
-      insertionIndex: -1,
-      deploymentMode: 'ELITE_BENTO',
-    };
-    
-    // Cache successful result to avoid future API calls
-    SerpApiCache.set(asin, result);
-    console.log(`[SerpAPI] Cached product: ${result.title}`);
-    
-    return result;
-  } catch (error) {
-    console.warn(`[fetchProductByASIN] Lookup failed for "${asin}":`, error);
-    return {
-      id: `manual-${asin}-${Date.now()}`,
-      asin,
-      title: `Amazon Product (${asin})`,
-      brand: '',
-      category: '',
-      price: 'Check Price',
-      imageUrl: `https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN=${asin}&Format=_SL250_&ID=AsinImage&ServiceVersion=20070822&WS=1`,
-      rating: 4.5,
-      reviewCount: 100,
-      prime: true,
-      faqs: [],
-      entities: [],
-      evidenceClaims: [],
-      insertionIndex: -1,
-      deploymentMode: 'ELITE_BENTO',
-    };
-  }
-};
 
 export const searchAmazonProduct = async (
   query: string, 
